@@ -1,6 +1,8 @@
 """
-Ball tracking + simple putt counting (attempts when crossing start line toward cup;
-made when the ball settles slowly near the cup center (not just inside the big cup box — avoids lip-outs / flyovers).
+Ball tracking + simple putt counting:
+- Attempts when crossing the start line toward the cup.
+- Made when the ball settles inside a tight ellipse and passes a short confirmation window (rolls past cancel).
+- Near the cup, tracking follows motion continuity so the rim/corner does not steal the lock from the real ball.
 
 1) Calibrate (first time or with --calibrate):
    - Drag a rectangle around the cup / hole (ENTER to confirm).
@@ -432,6 +434,13 @@ def expand_roi_xywh(
     return (float(x0), float(y0), float(x1 - x0), float(y1 - y0))
 
 
+# Cup-rim latch: blob must lie at least this cosine vs recent velocity (last→candidate vs motion).
+CUP_LATCH_COS_MIN = 0.52
+# When tracker is already near the cup, cap max jump so the ball cannot teleport to the far rim/corner.
+NEAR_CUP_JUMP_MULT = 1.18
+NEAR_CUP_JUMP_DIST_FRAC = 1.28  # distance to cup center vs max(cup w,h)
+
+
 def cup_ignore_zone(cup_px: tuple[int, int, int, int], scale: float = 1.38) -> tuple[int, int, int, int]:
     """Expanded cup box: ignore bright blobs here right after a make (hole rim / glare)."""
     x, y, w, h = cup_px
@@ -457,6 +466,7 @@ def find_ball(
     active_ball_px: tuple[int, int, int, int] | None = None,
     green_edge_line: tuple[tuple[int, int], tuple[int, int]] | None = None,
     green_valid_sign: float | None = None,
+    motion_vel: tuple[float, float] | None = None,
 ) -> tuple[float, float] | None:
     fh, fw = frame_bgr.shape[:2]
     max_area = _max_ball_area(fw, fh, params.max_area_frac)
@@ -531,6 +541,21 @@ def find_ball(
         cy = m["m01"] / m["m00"]
         if ignore_near_cup is not None and point_in_rect((cx, cy), ignore_near_cup):
             continue
+        if (
+            last_xy is not None
+            and motion_vel is not None
+            and point_in_rect((cx, cy), cup_px)
+            and not point_in_rect(last_xy, cup_px)
+        ):
+            vx, vy = motion_vel
+            vl = math.hypot(vx, vy)
+            if vl >= 1.6:
+                lx, ly = last_xy
+                ux, uy = cx - lx, cy - ly
+                ul = math.hypot(ux, uy) or 1e-6
+                cos_al = (ux * vx + uy * vy) / (ul * vl)
+                if cos_al < CUP_LATCH_COS_MIN:
+                    continue
         if green_edge_line is not None and green_valid_sign is not None:
             ge1, ge2 = green_edge_line
             if green_valid_sign * line_side((cx, cy), ge1, ge2) <= 1e-3:
@@ -552,8 +577,20 @@ def find_ball(
     if not candidates:
         return None
     if last_xy is not None:
-        best = max(candidates, key=lambda t: (t[0], -dist_sq(t[1], last_xy)))
-        return best[1]
+        lx, ly = last_xy
+        vx, vy = (0.0, 0.0) if motion_vel is None else motion_vel
+        vlen = math.hypot(vx, vy)
+        pred_x = lx + vx
+        pred_y = ly + vy
+
+        def track_pick_key(t: tuple[float, tuple[float, float]]) -> tuple[float, float]:
+            px, py = t[1]
+            d_pred = dist_sq((px, py), (pred_x, pred_y))
+            d_last = dist_sq((px, py), last_xy)
+            primary = d_pred if vlen >= 2.0 else d_last
+            return (primary, -t[0])
+
+        return min(candidates, key=track_pick_key)[1]
 
     def init_key(t: tuple[float, tuple[float, float]]) -> tuple[float, float, float, float]:
         px, py = t[1]
@@ -599,13 +636,22 @@ MIN_TEE_FRAMES_FIRST_STROKE = 10
 FRAMES_ON_TEE_TO_ARM_NEXT_MAKE = 10
 # Need this many frames on tee before "made" can register (blocks false make at clip start).
 MIN_ADDRESS_FRAMES_FOR_MADE = 10
-# Made geometry: must be near cup center (fraction of min(cup w,h)), not only inside loose ROI.
-MADE_CUP_CENTER_FRAC = 0.44
+# Made geometry: axis-aligned ellipse in the cup ROI (tighter vertically than horizontally).
+# Small misses "above" the hole often still fit a circle around the ROI center; the ellipse drops those.
+MADE_AXIS_RX_FRAC = 0.42
+MADE_AXIS_RY_FRAC = 0.28
 CUP_INNER_MARGIN_FRAC = 0.17
 # Raw detection speed (px per frame); lip-outs stay fast, holed putts slow before counting as made.
 MADE_MAX_SPEED_PPF = 8.5
 # Consecutive frames ball must satisfy made geometry + speed before registering a make.
 MADE_DWELL_FRAMES = 5
+# After dwell, need this many more frames still inside zone + slow — rejects "rolls past" transits.
+MADE_CONFIRM_FRAMES = 8
+# During confirm, allow this many consecutive lost-track frames (ball may vanish into cup) before aborting.
+MADE_CONFIRM_MAX_NONE_FRAMES = 5
+# After an attempt, if we're stuck cup-side with low motion this long, force re-acquire (next ball on tee).
+POST_ATTEMPT_CUP_STALL_FRAMES = 52
+POST_ATTEMPT_STALL_MAX_SPEED_PPF = 4.8
 
 
 @dataclass
@@ -625,6 +671,10 @@ class PuttCounter:
     pending_tracker_reset: bool = False
     away_cup_streak: int = 0
     addressed_ok: bool = False
+    make_confirm_remaining: int | None = None
+    make_confirm_none_streak: int = 0
+    pending_reacquire: bool = False
+    post_attempt_cup_stall: int = 0
 
     def clear_line_memory(self) -> None:
         self.last_side = None
@@ -639,11 +689,21 @@ class PuttCounter:
         self.pending_tracker_reset = False
         return True
 
+    def pull_reacquire(self) -> bool:
+        if not self.pending_reacquire:
+            return False
+        self.pending_reacquire = False
+        return True
+
     def _on_make_registered(self) -> None:
         self.made_for_current_roll = True
         self.pending_tracker_reset = True
         self.cup_suppress_frames = 60
         self.addressed_ok = False
+        self.make_confirm_remaining = None
+        self.make_confirm_none_streak = 0
+        self.pending_reacquire = False
+        self.post_attempt_cup_stall = 0
 
     def update(
         self,
@@ -658,7 +718,15 @@ class PuttCounter:
             self.cooldown_frames -= 1
 
         if ball is None:
+            if self.make_confirm_remaining is not None:
+                self.make_confirm_none_streak += 1
+                if self.make_confirm_none_streak > MADE_CONFIRM_MAX_NONE_FRAMES:
+                    self.make_confirm_remaining = None
+                    self.in_cup_frames = 0
+                    self.make_confirm_none_streak = 0
             return
+
+        self.make_confirm_none_streak = 0
 
         prev_tee = self.tee_consecutive
         side_raw = line_side(ball, p1, p2)
@@ -672,11 +740,15 @@ class PuttCounter:
         # Ready for a new stroke's attempt counting after ball has sat on tee side briefly.
         if self.back_side_streak >= 5:
             self.counted_attempt_this_stroke = False
+            self.make_confirm_remaining = None
+            self.in_cup_frames = 0
+            self.post_attempt_cup_stall = 0
 
         # Same spot, new ball: you don't always cross the line "backward" after a make.
         if self.made_for_current_roll and self.back_side_streak >= FRAMES_ON_TEE_TO_ARM_NEXT_MAKE:
             self.made_for_current_roll = False
             self.in_cup_frames = 0
+            self.make_confirm_remaining = None
 
         x, y, w, h = cup_px
         cup_cx = x + w * 0.5
@@ -690,6 +762,11 @@ class PuttCounter:
         if self.made_for_current_roll and self.away_cup_streak >= 8:
             self.made_for_current_roll = False
             self.in_cup_frames = 0
+            self.make_confirm_remaining = None
+
+        # Returning to tee after looking at a miss: reset lock so the next address is tracked.
+        if self.last_side is not None and self.last_side > 0 and side < 0:
+            self.pending_reacquire = True
 
         if self.last_side is not None and abs(self.last_side) > 1e-3 and abs(side) > 1e-3:
             if (
@@ -708,6 +785,7 @@ class PuttCounter:
                 self.counted_attempt_this_stroke = True
                 self.made_for_current_roll = False
                 self.in_cup_frames = 0
+                self.make_confirm_remaining = None
                 self.armed = False
                 self.cooldown_frames = 14
                 self.addressed_ok = True
@@ -721,29 +799,66 @@ class PuttCounter:
         inner_w, inner_h = w * (1 - m), h * (1 - m)
         ox, oy = x + (w - inner_w) / 2, y + (h - inner_h) / 2
         inner_rect = (ox, oy, inner_w, inner_h)
-        made_radius = min(w, h) * MADE_CUP_CENTER_FRAC
-        near_cup_center = dist_cup <= made_radius
+        dx_m = ball[0] - cup_cx
+        dy_m = ball[1] - cup_cy
+        sx = max(4.0, w * MADE_AXIS_RX_FRAC)
+        sy = max(4.0, h * MADE_AXIS_RY_FRAC)
+        in_made_ellipse = (dx_m / sx) ** 2 + (dy_m / sy) ** 2 <= 1.0
         in_inner = point_in_rect(ball, inner_rect)
         speed_ok = (
             ball_speed_ppf is not None
             and ball_speed_ppf <= MADE_MAX_SPEED_PPF
         )
-        if (
+        make_ok_base = (
             in_inner
-            and near_cup_center
+            and in_made_ellipse
             and speed_ok
             and not self.made_for_current_roll
             and (self.addressed_ok or self.counted_attempt_this_stroke)
-        ):
+        )
+
+        if self.make_confirm_remaining is not None:
+            if make_ok_base:
+                self.make_confirm_remaining -= 1
+                if self.make_confirm_remaining <= 0:
+                    if not self.counted_attempt_this_stroke:
+                        self.attempts += 1
+                        self.counted_attempt_this_stroke = True
+                    self.made += 1
+                    self._on_make_registered()
+            else:
+                # Left the made zone or sped up — rolled past, not holed out.
+                self.make_confirm_remaining = None
+                self.in_cup_frames = 0
+        elif make_ok_base:
             self.in_cup_frames += 1
             if self.in_cup_frames >= MADE_DWELL_FRAMES:
-                if not self.counted_attempt_this_stroke:
-                    self.attempts += 1
-                    self.counted_attempt_this_stroke = True
-                self.made += 1
-                self._on_make_registered()
+                self.make_confirm_remaining = MADE_CONFIRM_FRAMES
+                self.in_cup_frames = 0
         else:
             self.in_cup_frames = 0
+
+        # Stuck cup-side (smoothed lock near hole) after a miss while the next ball waits on the tee.
+        if (
+            not self.counted_attempt_this_stroke
+            or self.made_for_current_roll
+            or self.make_confirm_remaining is not None
+            or self.in_cup_frames > 0
+        ):
+            self.post_attempt_cup_stall = 0
+        elif side > 0:
+            if (
+                ball_speed_ppf is not None
+                and ball_speed_ppf <= POST_ATTEMPT_STALL_MAX_SPEED_PPF
+            ):
+                self.post_attempt_cup_stall += 1
+                if self.post_attempt_cup_stall >= POST_ATTEMPT_CUP_STALL_FRAMES:
+                    self.pending_reacquire = True
+                    self.post_attempt_cup_stall = 0
+            else:
+                self.post_attempt_cup_stall = 0
+        else:
+            self.post_attempt_cup_stall = 0
 
         if side < 0:
             self.tee_consecutive += 1
@@ -752,6 +867,21 @@ class PuttCounter:
 
         if self.tee_consecutive >= MIN_ADDRESS_FRAMES_FOR_MADE:
             self.addressed_ok = True
+
+
+def _tail_velocity(positions: deque[tuple[float, float]]) -> tuple[float, float] | None:
+    """Recent raw motion (px/frame), smoothed over two steps when possible."""
+    if len(positions) < 2:
+        return None
+    pts = list(positions)
+    if len(pts) >= 3:
+        p0, p1, p2 = pts[-3], pts[-2], pts[-1]
+        return (
+            (p2[0] - p1[0] + p1[0] - p0[0]) * 0.5,
+            (p2[1] - p1[1] + p1[1] - p0[1]) * 0.5,
+        )
+    p0, p1 = pts[-2], pts[-1]
+    return (p1[0] - p0[0], p1[1] - p0[1])
 
 
 def _avg_displacement_ppf(positions: deque[tuple[float, float]]) -> float | None:
@@ -852,7 +982,15 @@ def main() -> None:
             counter.tick_timers()
             ignore_cup = cup_ignore_zone(cup_px) if counter.cup_suppress_frames > 0 else None
 
+            motion_vel = _tail_velocity(raw_positions)
             effective_jump = max_jump * (2.35 if jump_boost_frames > 0 else 1.0)
+            if last_ball is not None:
+                ccx = cup_px[0] + cup_px[2] * 0.5
+                ccy = cup_px[1] + cup_px[3] * 0.5
+                dlc = math.hypot(last_ball[0] - ccx, last_ball[1] - ccy)
+                near_th = max(cup_px[2], cup_px[3]) * NEAR_CUP_JUMP_DIST_FRAC
+                if dlc < near_th:
+                    effective_jump = min(effective_jump, max_jump * NEAR_CUP_JUMP_MULT)
             raw_ball = find_ball(
                 frame,
                 last_ball,
@@ -867,20 +1005,38 @@ def main() -> None:
                 active_ball_px=active_ball_px,
                 green_edge_line=green_edge_line,
                 green_valid_sign=green_valid_sign,
+                motion_vel=motion_vel,
             )
             if raw_ball is not None:
-                raw_positions.append(raw_ball)
-                if last_ball is None:
-                    jump_boost_frames = 28
-                miss_streak = 0
-                last_ball = raw_ball
-                if smooth is None:
+                p1, p2 = line_px
+                tee_snap = False
+                if smooth is not None:
+                    s_raw = cup_left_sign * line_side(raw_ball, p1, p2)
+                    s_sm = cup_left_sign * line_side(smooth, p1, p2)
+                    d_rs = math.hypot(raw_ball[0] - smooth[0], raw_ball[1] - smooth[1])
+                    split_min = max(48.0, min(fw, fh) * 0.058)
+                    if s_raw < 0 and s_sm > 0 and d_rs > split_min:
+                        tee_snap = True
+                if tee_snap:
+                    last_ball = raw_ball
                     smooth = raw_ball
+                    raw_positions.clear()
+                    raw_positions.append(raw_ball)
+                    miss_streak = 0
+                    jump_boost_frames = max(jump_boost_frames, 24)
                 else:
-                    smooth = (
-                        alpha * raw_ball[0] + (1 - alpha) * smooth[0],
-                        alpha * raw_ball[1] + (1 - alpha) * smooth[1],
-                    )
+                    raw_positions.append(raw_ball)
+                    if last_ball is None:
+                        jump_boost_frames = 28
+                    miss_streak = 0
+                    last_ball = raw_ball
+                    if smooth is None:
+                        smooth = raw_ball
+                    else:
+                        smooth = (
+                            alpha * raw_ball[0] + (1 - alpha) * smooth[0],
+                            alpha * raw_ball[1] + (1 - alpha) * smooth[1],
+                        )
             else:
                 miss_streak += 1
                 if miss_streak > 8:
@@ -906,7 +1062,7 @@ def main() -> None:
                 cup_left_sign,
                 ball_speed_ppf=ball_speed,
             )
-            if counter.pull_tracker_reset():
+            if counter.pull_tracker_reset() or counter.pull_reacquire():
                 last_ball = None
                 smooth = None
                 miss_streak = 0
@@ -920,8 +1076,8 @@ def main() -> None:
             x, y, w, h = cup_px
             cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 165, 255), 2)
             ccx, ccy = int(x + w * 0.5), int(y + h * 0.5)
-            made_r = int(min(w, h) * MADE_CUP_CENTER_FRAC)
-            cv2.circle(vis, (ccx, ccy), made_r, (180, 255, 200), 1)
+            ex, ey = int(w * MADE_AXIS_RX_FRAC), int(h * MADE_AXIS_RY_FRAC)
+            cv2.ellipse(vis, (ccx, ccy), (max(1, ex), max(1, ey)), 0, 0, 360, (180, 255, 200), 1)
             cv2.line(vis, line_px[0], line_px[1], (0, 255, 0), 2)
             if ignore_pile_px is not None:
                 ix, iy, iw, ih = ignore_pile_px
