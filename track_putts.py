@@ -1301,11 +1301,11 @@ def main() -> None:
             cv2.putText(
                 vis,
                 dbg_line,
-                (10, 22),
+                (10, fh - 92),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (220, 220, 220),
-                1,
+                0.9,
+                (255, 255, 255),
+                2,
                 cv2.LINE_AA,
             )
             dbg_line2 = (
@@ -1317,11 +1317,11 @@ def main() -> None:
             cv2.putText(
                 vis,
                 dbg_line2,
-                (10, 40),
+                (10, fh - 66),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (220, 220, 220),
-                1,
+                0.9,
+                (255, 255, 255),
+                2,
                 cv2.LINE_AA,
             )
 
