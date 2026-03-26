@@ -1,2 +1,5 @@
 # Local capture / test footage (large binaries)
-training_videos/
+videos/
+logs/
+__pycache__/
+*.pyc

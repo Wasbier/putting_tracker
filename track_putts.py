@@ -40,6 +40,31 @@ import numpy as np
 from capture_utils import open_capture
 
 CONFIG_NAME = "tracking_config.json"
+DEFAULT_PROFILES_DIR = Path("config/profiles")
+
+DEFAULT_DETECTOR_CFG: dict[str, float] = {
+    "v_min": 90.0,
+    "s_max": 120.0,
+    "min_area": 40.0,
+    "min_circularity": 0.52,
+    "max_area_frac": 1.0 / 350.0,
+}
+
+DEFAULT_LOGIC_CFG: dict[str, float] = {
+    "min_tee_frames_for_stroke": 22.0,
+    "min_tee_frames_first_stroke": 10.0,
+    "frames_on_tee_to_arm_next_make": 10.0,
+    "min_address_frames_for_made": 10.0,
+    "made_axis_rx_frac": 0.42,
+    "made_axis_ry_frac": 0.28,
+    "cup_inner_margin_frac": 0.17,
+    "made_max_speed_ppf": 8.5,
+    "made_dwell_frames": 5.0,
+    "made_confirm_frames": 8.0,
+    "made_confirm_max_none_frames": 5.0,
+    "post_attempt_cup_stall_frames": 52.0,
+    "post_attempt_stall_max_speed_ppf": 4.8,
+}
 
 
 # --- geometry ---
@@ -137,6 +162,15 @@ def scene_roi_from_calibration(
     return (x0, y0, x1 - x0, y1 - y0)
 
 
+def _merge_numeric_settings(defaults: dict[str, float], raw: Any) -> dict[str, float]:
+    out = defaults.copy()
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if k in out and isinstance(v, (int, float)):
+                out[k] = float(v)
+    return out
+
+
 def load_config(path: Path, frame_w: int, frame_h: int) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     px = _norm_to_px(data, frame_w, frame_h)
@@ -176,6 +210,8 @@ def load_config(path: Path, frame_w: int, frame_h: int) -> dict[str, Any]:
         if abs(sge) >= 3.0:
             green_edge_line = (e1, e2)
             green_valid_sign = 1.0 if sge > 0 else -1.0
+    detector_cfg = _merge_numeric_settings(DEFAULT_DETECTOR_CFG, data.get("detector"))
+    logic_cfg = _merge_numeric_settings(DEFAULT_LOGIC_CFG, data.get("logic"))
     out: dict[str, Any] = {
         "cup_px": c,
         "line_px": (p1, p2),
@@ -185,6 +221,8 @@ def load_config(path: Path, frame_w: int, frame_h: int) -> dict[str, Any]:
         "active_ball_px": active_ball,
         "green_edge_line": green_edge_line,
         "green_valid_sign": green_valid_sign,
+        "detector_cfg": detector_cfg,
+        "logic_cfg": logic_cfg,
     }
     return out
 
@@ -198,6 +236,8 @@ def save_config_norm(
     ignore_pile_roi: tuple[int, int, int, int] | None = None,
     active_ball_roi: tuple[int, int, int, int] | None = None,
     green_edge_pts: tuple[tuple[int, int], tuple[int, int]] | None = None,
+    detector_cfg: dict[str, float] | None = None,
+    logic_cfg: dict[str, float] | None = None,
 ) -> None:
     x, y, rw, rh = cup_roi
     (x1, y1), (x2, y2) = line_pts
@@ -221,6 +261,8 @@ def save_config_norm(
             "x2": gx2 / w,
             "y2": gy2 / h,
         }
+    data["detector"] = _merge_numeric_settings(DEFAULT_DETECTOR_CFG, detector_cfg)
+    data["logic"] = _merge_numeric_settings(DEFAULT_LOGIC_CFG, logic_cfg)
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
@@ -242,6 +284,7 @@ def calibrate_interactive(frame: np.ndarray, config_path: Path) -> None:
     )
     cv2.imshow("Calibrate", disp)
     cup = cv2.selectROI("Calibrate", frame, showCrosshair=True, fromCenter=False)
+    # Cup ROI is the anchor for both detection focus (near the hole) and the "made" dwell test.
     cup = (int(cup[0]), int(cup[1]), int(cup[2]), int(cup[3]))
     if cup[2] <= 0 or cup[3] <= 0:
         raise SystemExit("Cup ROI empty; try again.")
@@ -293,6 +336,7 @@ def calibrate_interactive(frame: np.ndarray, config_path: Path) -> None:
     )
     cv2.imshow("Calibrate", img3)
     pile = cv2.selectROI("Calibrate", frame, showCrosshair=True, fromCenter=False)
+    # Spare pile ROI is masked on re-acquire so the detector doesn't "grab" pile rocks instead of YOUR ball.
     pile_t = (int(pile[0]), int(pile[1]), int(pile[2]), int(pile[3]))
     ignore_pile = pile_t if pile_t[2] >= 8 and pile_t[3] >= 8 else None
 
@@ -319,6 +363,7 @@ def calibrate_interactive(frame: np.ndarray, config_path: Path) -> None:
     )
     cv2.imshow("Calibrate", img4)
     ab = cv2.selectROI("Calibrate", frame, showCrosshair=True, fromCenter=False)
+    # Active-ball ROI is used on re-acquire to prevent blur/morph from merging the pile into the mask.
     ab_t = (int(ab[0]), int(ab[1]), int(ab[2]), int(ab[3]))
     active_ball = ab_t if ab_t[2] >= 8 and ab_t[3] >= 8 else None
 
@@ -467,14 +512,33 @@ def find_ball(
     green_edge_line: tuple[tuple[int, int], tuple[int, int]] | None = None,
     green_valid_sign: float | None = None,
     motion_vel: tuple[float, float] | None = None,
+    debug_counts: dict[str, int] | None = None,
 ) -> tuple[float, float] | None:
     fh, fw = frame_bgr.shape[:2]
     max_area = _max_ball_area(fw, fh, params.max_area_frac)
     pile_pad = max(48, int(min(fw, fh) * 0.055))
+    if debug_counts is not None:
+        debug_counts.clear()
+        debug_counts.update(
+            {
+                "contours": 0,
+                "rej_area": 0,
+                "rej_circularity": 0,
+                "rej_moments": 0,
+                "rej_cup_ignore": 0,
+                "rej_cup_latch": 0,
+                "rej_green_edge": 0,
+                "rej_jump": 0,
+                "rej_hole_center": 0,
+                "rej_pile": 0,
+                "candidates": 0,
+            }
+        )
 
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     lower = np.array([0, 0, params.v_min], dtype=np.uint8)
     upper = np.array([180, params.s_max, 255], dtype=np.uint8)
+    # HSV thresholding: isolates bright-ish, low-saturation blobs (the ball) from the mat.
     mask = cv2.inRange(hsv, lower, upper)
     # Drop obvious green turf (helps white ball pop on green)
     green = cv2.inRange(hsv, (35, 40, 40), (90, 255, 255))
@@ -484,12 +548,14 @@ def find_ball(
     mask = cv2.medianBlur(mask, 5)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    # Blur + morphology stabilizes blobs so circularity/area gating is less sensitive to noise.
 
     if scene_roi is not None:
         rx, ry, rw, rh = scene_roi
         roi_mask = np.zeros((fh, fw), dtype=np.uint8)
         roi_mask[ry : ry + rh, rx : rx + rw] = 255
         mask = cv2.bitwise_and(mask, roi_mask)
+        # Scene ROI keeps us from chasing blobs in the background (lights/sky).
 
     if last_xy is None and ignore_pile_px is not None:
         _zero_mask_rectangle(mask, ignore_pile_px, pile_pad)
@@ -503,8 +569,11 @@ def find_ball(
             zone_m = np.zeros((fh, fw), dtype=np.uint8)
             zone_m[yi : yi + hi, xi : xi + wi] = 255
             mask = cv2.bitwise_and(mask, zone_m)
+            # When we have no previous position, only trust blobs inside the calibrated active-ball box.
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if debug_counts is not None:
+        debug_counts["contours"] = len(contours)
     (lx1, ly1), (lx2, ly2) = line_px
     cx_cup = cup_px[0] + cup_px[2] * 0.5
     cy_cup = cup_px[1] + cup_px[3] * 0.5
@@ -527,20 +596,29 @@ def find_ball(
     for c in contours:
         a = cv2.contourArea(c)
         if a < params.min_area or a > max_area:
+            if debug_counts is not None:
+                debug_counts["rej_area"] += 1
             continue
         peri = cv2.arcLength(c, True)
         if peri <= 1e-6:
             continue
         circ = 4.0 * math.pi * a / (peri * peri)
         if circ < params.min_circularity:
+            if debug_counts is not None:
+                debug_counts["rej_circularity"] += 1
             continue
         m = cv2.moments(c)
         if m["m00"] == 0:
+            if debug_counts is not None:
+                debug_counts["rej_moments"] += 1
             continue
         cx = m["m10"] / m["m00"]
         cy = m["m01"] / m["m00"]
         if ignore_near_cup is not None and point_in_rect((cx, cy), ignore_near_cup):
+            if debug_counts is not None:
+                debug_counts["rej_cup_ignore"] += 1
             continue
+        # Ignore the rim/glare zone right after a make so it doesn't instantly re-count.
         if (
             last_xy is not None
             and motion_vel is not None
@@ -555,24 +633,47 @@ def find_ball(
                 ul = math.hypot(ux, uy) or 1e-6
                 cos_al = (ux * vx + uy * vy) / (ul * vl)
                 if cos_al < CUP_LATCH_COS_MIN:
+                    if debug_counts is not None:
+                        debug_counts["rej_cup_latch"] += 1
                     continue
+        # Cup-rim latch: if a candidate appears "inside the cup box" but doesn't line up with recent motion,
+        # we assume it's a rim/glare blob and reject it.
         if green_edge_line is not None and green_valid_sign is not None:
             ge1, ge2 = green_edge_line
             if green_valid_sign * line_side((cx, cy), ge1, ge2) <= 1e-3:
+                if debug_counts is not None:
+                    debug_counts["rej_green_edge"] += 1
                 continue
+        # Optional mat edge filter: ignore floor/rocks on the invalid side of the orange line.
         if last_xy is not None:
             d = math.sqrt(dist_sq((cx, cy), last_xy))
             if d > max_jump_px:
+                if debug_counts is not None:
+                    debug_counts["rej_jump"] += 1
                 continue
             d_last_cup = math.hypot(last_xy[0] - cx_cup, last_xy[1] - cy_cup)
             if d_last_cup > approach_release and point_in_rect((cx, cy), hole_center_rect):
-                continue
+                # If motion is heading into the cup, allow this candidate; otherwise treat as hole/rim artifact.
+                if motion_vel is not None:
+                    mvx, mvy = motion_vel
+                    to_cx, to_cy = cx_cup - last_xy[0], cy_cup - last_xy[1]
+                    if to_cx * mvx + to_cy * mvy <= 0:
+                        if debug_counts is not None:
+                            debug_counts["rej_hole_center"] += 1
+                        continue
+                # No reliable motion direction -> do NOT block; better to keep ball continuity near cup.
+            # Before we are "close enough", avoid hole-center blobs that often come from glare/rim artifacts.
         score = circ * math.sqrt(a)
         candidates.append((score, (cx, cy)))
 
     if ignore_pile_px is not None:
         pile_rect = expand_roi_xywh(ignore_pile_px, pile_pad, fw, fh)
+        before = len(candidates)
         candidates = [t for t in candidates if not point_in_rect(t[1], pile_rect)]
+        if debug_counts is not None:
+            debug_counts["rej_pile"] += max(0, before - len(candidates))
+    if debug_counts is not None:
+        debug_counts["candidates"] = len(candidates)
 
     if not candidates:
         return None
@@ -583,6 +684,8 @@ def find_ball(
         pred_x = lx + vx
         pred_y = ly + vy
 
+        # Choose the candidate closest to the predicted next position (motion continuity),
+        # rather than simply the "most circular" contour.
         def track_pick_key(t: tuple[float, tuple[float, float]]) -> tuple[float, float]:
             px, py = t[1]
             d_pred = dist_sq((px, py), (pred_x, pred_y))
@@ -603,7 +706,16 @@ def find_ball(
         )
 
     if active_ball_px is not None:
-        return min(candidates, key=init_key)[1]
+        # Re-acquire should lock to the calibrated ball-address spot, not any incidental blob (toe/club).
+        ax, ay, aw, ah = active_ball_px
+        ab_center = (ax + aw * 0.5, ay + ah * 0.5)
+
+        def active_key(t: tuple[float, tuple[float, float]]) -> tuple[float, float, float]:
+            px, py = t[1]
+            # Primary: closest to active-ball center. Secondary: better contour score.
+            return (dist_sq((px, py), ab_center), -t[0], abs(py - ab_center[1]))
+
+        return min(candidates, key=active_key)[1]
 
     # Init: prefer tee side of line; among those, closest to address.
     p1, p2 = (lx1, ly1), (lx2, ly2)
@@ -730,6 +842,7 @@ class PuttCounter:
 
         prev_tee = self.tee_consecutive
         side_raw = line_side(ball, p1, p2)
+        # side > 0 means "front/cup side" (toward the hole). side < 0 means "tee side" (start side).
         side = cup_left_sign * side_raw
 
         if side < 0:
@@ -781,6 +894,7 @@ class PuttCounter:
                     else MIN_TEE_FRAMES_FIRST_STROKE
                 )
             ):
+            # Attempt: we only count a crossing after the ball has been on tee side for a while.
                 self.attempts += 1
                 self.counted_attempt_this_stroke = True
                 self.made_for_current_roll = False
@@ -819,6 +933,7 @@ class PuttCounter:
 
         if self.make_confirm_remaining is not None:
             if make_ok_base:
+                # Confirm after dwell: if the ball rolls past quickly, it should fail this phase.
                 self.make_confirm_remaining -= 1
                 if self.make_confirm_remaining <= 0:
                     if not self.counted_attempt_this_stroke:
@@ -833,6 +948,7 @@ class PuttCounter:
         elif make_ok_base:
             self.in_cup_frames += 1
             if self.in_cup_frames >= MADE_DWELL_FRAMES:
+                # First phase: short dwell inside the made ellipse before we arm confirmation.
                 self.make_confirm_remaining = MADE_CONFIRM_FRAMES
                 self.in_cup_frames = 0
         else:
@@ -866,6 +982,7 @@ class PuttCounter:
             self.tee_consecutive = 0
 
         if self.tee_consecutive >= MIN_ADDRESS_FRAMES_FOR_MADE:
+            # After we've sat on tee side for long enough, allow cup dwell to count as made.
             self.addressed_ok = True
 
 
@@ -898,6 +1015,45 @@ def _avg_displacement_ppf(positions: deque[tuple[float, float]]) -> float | None
     return total / (len(pts) - 1)
 
 
+def _apply_logic_cfg(logic_cfg: dict[str, float]) -> None:
+    """Apply per-profile logic settings to runtime globals."""
+    global MIN_TEE_FRAMES_FOR_STROKE
+    global MIN_TEE_FRAMES_FIRST_STROKE
+    global FRAMES_ON_TEE_TO_ARM_NEXT_MAKE
+    global MIN_ADDRESS_FRAMES_FOR_MADE
+    global MADE_AXIS_RX_FRAC
+    global MADE_AXIS_RY_FRAC
+    global CUP_INNER_MARGIN_FRAC
+    global MADE_MAX_SPEED_PPF
+    global MADE_DWELL_FRAMES
+    global MADE_CONFIRM_FRAMES
+    global MADE_CONFIRM_MAX_NONE_FRAMES
+    global POST_ATTEMPT_CUP_STALL_FRAMES
+    global POST_ATTEMPT_STALL_MAX_SPEED_PPF
+
+    MIN_TEE_FRAMES_FOR_STROKE = int(logic_cfg["min_tee_frames_for_stroke"])
+    MIN_TEE_FRAMES_FIRST_STROKE = int(logic_cfg["min_tee_frames_first_stroke"])
+    FRAMES_ON_TEE_TO_ARM_NEXT_MAKE = int(logic_cfg["frames_on_tee_to_arm_next_make"])
+    MIN_ADDRESS_FRAMES_FOR_MADE = int(logic_cfg["min_address_frames_for_made"])
+    MADE_AXIS_RX_FRAC = float(logic_cfg["made_axis_rx_frac"])
+    MADE_AXIS_RY_FRAC = float(logic_cfg["made_axis_ry_frac"])
+    CUP_INNER_MARGIN_FRAC = float(logic_cfg["cup_inner_margin_frac"])
+    MADE_MAX_SPEED_PPF = float(logic_cfg["made_max_speed_ppf"])
+    MADE_DWELL_FRAMES = int(logic_cfg["made_dwell_frames"])
+    MADE_CONFIRM_FRAMES = int(logic_cfg["made_confirm_frames"])
+    MADE_CONFIRM_MAX_NONE_FRAMES = int(logic_cfg["made_confirm_max_none_frames"])
+    POST_ATTEMPT_CUP_STALL_FRAMES = int(logic_cfg["post_attempt_cup_stall_frames"])
+    POST_ATTEMPT_STALL_MAX_SPEED_PPF = float(logic_cfg["post_attempt_stall_max_speed_ppf"])
+
+
+def _infer_profile_tag(frame_bgr: np.ndarray) -> tuple[str, float]:
+    """Simple day/night split from scene brightness."""
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    med = float(np.median(gray))
+    tag = "day" if med >= 78.0 else "night"
+    return tag, med
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Track putts from webcam or video")
     g = p.add_mutually_exclusive_group(required=True)
@@ -909,6 +1065,23 @@ def main() -> None:
         type=Path,
         default=Path(CONFIG_NAME),
         help=f"Calibration JSON (default: {CONFIG_NAME})",
+    )
+    p.add_argument(
+        "--profile",
+        choices=["day", "night", "auto"],
+        help="Use profile config from --profiles-dir and --camera-id (overrides --config).",
+    )
+    p.add_argument(
+        "--camera-id",
+        type=str,
+        default="camera1",
+        help="Profile camera name for --profile mode (default: camera1).",
+    )
+    p.add_argument(
+        "--profiles-dir",
+        type=Path,
+        default=DEFAULT_PROFILES_DIR,
+        help=f"Profile configs directory (default: {DEFAULT_PROFILES_DIR}).",
     )
     p.add_argument("--calibrate", action="store_true", help="Draw cup ROI + start line, save config")
     p.add_argument(
@@ -924,13 +1097,26 @@ def main() -> None:
         raise SystemExit("Could not read first frame.")
     fh, fw = frame0.shape[:2]
 
+    config_path = args.config
+    selected_profile: str | None = None
+    if args.profile is not None:
+        if args.profile == "auto":
+            if args.calibrate:
+                raise SystemExit("Use --profile day/night for calibration (auto is runtime-only).")
+            selected_profile, med = _infer_profile_tag(frame0)
+            print(f"Auto profile: median gray {med:.1f} -> {selected_profile}")
+        else:
+            selected_profile = args.profile
+        config_path = args.profiles_dir / f"{args.camera_id}_{selected_profile}.json"
+        print(f"Profile config: {config_path}")
+
     if args.calibrate:
-        calibrate_interactive(frame0, args.config)
+        calibrate_interactive(frame0, config_path)
 
-    if not args.config.is_file():
-        raise SystemExit(f"Missing {args.config}; run once with --calibrate")
+    if not config_path.is_file():
+        raise SystemExit(f"Missing {config_path}; run once with --calibrate")
 
-    cfg = load_config(args.config, fw, fh)
+    cfg = load_config(config_path, fw, fh)
     cup_px = cfg["cup_px"]
     line_px = cfg["line_px"]
     cup_left_sign = cfg["cup_left_sign"]
@@ -939,11 +1125,20 @@ def main() -> None:
     active_ball_px: tuple[int, int, int, int] | None = cfg.get("active_ball_px")
     green_edge_line: tuple[tuple[int, int], tuple[int, int]] | None = cfg.get("green_edge_line")
     green_valid_sign: float | None = cfg.get("green_valid_sign")
+    detector_cfg: dict[str, float] = cfg.get("detector_cfg", DEFAULT_DETECTOR_CFG.copy())
+    logic_cfg: dict[str, float] = cfg.get("logic_cfg", DEFAULT_LOGIC_CFG.copy())
+    _apply_logic_cfg(logic_cfg)
     max_jump = max(36.0, min(fw, fh) * 0.11)
     hold_frames = 12
     lose_track_frames = hold_frames * 8
 
-    detector = DetectorParams()
+    detector = DetectorParams(
+        v_min=int(detector_cfg["v_min"]),
+        s_max=int(detector_cfg["s_max"]),
+        min_area=int(detector_cfg["min_area"]),
+        min_circularity=float(detector_cfg["min_circularity"]),
+        max_area_frac=float(detector_cfg["max_area_frac"]),
+    )
     counter = PuttCounter()
     last_ball: tuple[float, float] | None = None
     smooth: tuple[float, float] | None = None
@@ -951,10 +1146,22 @@ def main() -> None:
     miss_streak = 0
     jump_boost_frames = 0
     raw_positions: deque[tuple[float, float]] = deque(maxlen=12)
+    detector_debug: dict[str, int] = {}
 
     window = "Putting tracker (q quit, r reset stats)"
     print("q = quit | r = reset attempt/made counts")
     print(f"Tracking zone from calibration; max jump {max_jump:.0f}px — cyan box")
+    print(
+        "detector:"
+        f" v_min={detector.v_min} s_max={detector.s_max}"
+        f" min_area={detector.min_area} min_circ={detector.min_circularity:.2f}"
+    )
+    print(
+        "logic:"
+        f" made_speed<={MADE_MAX_SPEED_PPF:.1f}"
+        f" dwell={MADE_DWELL_FRAMES} confirm={MADE_CONFIRM_FRAMES}"
+        f" ellipse=({MADE_AXIS_RX_FRAC:.2f},{MADE_AXIS_RY_FRAC:.2f})"
+    )
     if ignore_pile_px is not None:
         print("ignore_pile ROI active (masked on re-acquire)")
     if active_ball_px is not None:
@@ -982,6 +1189,7 @@ def main() -> None:
             counter.tick_timers()
             ignore_cup = cup_ignore_zone(cup_px) if counter.cup_suppress_frames > 0 else None
 
+            # Use recent motion to (a) cap jumps near the cup and (b) help candidate selection.
             motion_vel = _tail_velocity(raw_positions)
             effective_jump = max_jump * (2.35 if jump_boost_frames > 0 else 1.0)
             if last_ball is not None:
@@ -1006,11 +1214,14 @@ def main() -> None:
                 green_edge_line=green_edge_line,
                 green_valid_sign=green_valid_sign,
                 motion_vel=motion_vel,
+                debug_counts=detector_debug,
             )
             if raw_ball is not None:
                 p1, p2 = line_px
                 tee_snap = False
                 if smooth is not None:
+                    # If raw sees the ball on tee side while smooth is still stuck cup-side,
+                    # snap smooth to raw so the next attempt can be detected.
                     s_raw = cup_left_sign * line_side(raw_ball, p1, p2)
                     s_sm = cup_left_sign * line_side(smooth, p1, p2)
                     d_rs = math.hypot(raw_ball[0] - smooth[0], raw_ball[1] - smooth[1])
@@ -1038,11 +1249,17 @@ def main() -> None:
                             alpha * raw_ball[1] + (1 - alpha) * smooth[1],
                         )
             else:
+                # No detection: count misses; if we're gone long enough, clear line memory / tracking state.
                 miss_streak += 1
                 if miss_streak > 8:
                     raw_positions.clear()
                 if miss_streak > hold_frames:
                     counter.clear_line_memory()
+                # If tracking goes stale for a while, force re-acquire so we don't stay latched to cup/leaf.
+                if active_ball_px is not None and miss_streak > 18:
+                    last_ball = None
+                    smooth = None
+                    jump_boost_frames = max(jump_boost_frames, 20)
                 if counter.made_for_current_roll and miss_streak > 14:
                     last_ball = None
                     smooth = None
@@ -1055,6 +1272,8 @@ def main() -> None:
 
             ball_for_logic = smooth if smooth is not None and miss_streak <= hold_frames else None
             ball_speed = _avg_displacement_ppf(raw_positions)
+            # Logic runs on smoothed positions (so it doesn't jitter across the line),
+            # but speed comes from raw history so we can reject fast "roll past" transits.
             counter.update(
                 ball_for_logic,
                 cup_px,
@@ -1063,6 +1282,7 @@ def main() -> None:
                 ball_speed_ppf=ball_speed,
             )
             if counter.pull_tracker_reset() or counter.pull_reacquire():
+                # After a make (or a forced re-acquire), wipe tracking history so we don't keep old latches.
                 last_ball = None
                 smooth = None
                 miss_streak = 0
@@ -1089,6 +1309,41 @@ def main() -> None:
                 cv2.line(vis, green_edge_line[0], green_edge_line[1], (255, 200, 100), 2)
             if smooth is not None:
                 cv2.circle(vis, (int(smooth[0]), int(smooth[1])), 10, (255, 0, 255), 2)
+
+            dbg_line = (
+                f"cnt:{detector_debug.get('contours', 0)} "
+                f"cand:{detector_debug.get('candidates', 0)} "
+                f"rej a:{detector_debug.get('rej_area', 0)} "
+                f"c:{detector_debug.get('rej_circularity', 0)} "
+                f"j:{detector_debug.get('rej_jump', 0)} "
+                f"h:{detector_debug.get('rej_hole_center', 0)}"
+            )
+            cv2.putText(
+                vis,
+                dbg_line,
+                (10, fh - 92),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            dbg_line2 = (
+                f"rej cup:{detector_debug.get('rej_cup_ignore', 0)} "
+                f"latch:{detector_debug.get('rej_cup_latch', 0)} "
+                f"edge:{detector_debug.get('rej_green_edge', 0)} "
+                f"pile:{detector_debug.get('rej_pile', 0)}"
+            )
+            cv2.putText(
+                vis,
+                dbg_line2,
+                (10, fh - 66),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
 
             label = f"Attempts: {counter.attempts}  Made: {counter.made}"
             cv2.putText(
