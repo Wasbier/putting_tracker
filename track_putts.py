@@ -512,10 +512,28 @@ def find_ball(
     green_edge_line: tuple[tuple[int, int], tuple[int, int]] | None = None,
     green_valid_sign: float | None = None,
     motion_vel: tuple[float, float] | None = None,
+    debug_counts: dict[str, int] | None = None,
 ) -> tuple[float, float] | None:
     fh, fw = frame_bgr.shape[:2]
     max_area = _max_ball_area(fw, fh, params.max_area_frac)
     pile_pad = max(48, int(min(fw, fh) * 0.055))
+    if debug_counts is not None:
+        debug_counts.clear()
+        debug_counts.update(
+            {
+                "contours": 0,
+                "rej_area": 0,
+                "rej_circularity": 0,
+                "rej_moments": 0,
+                "rej_cup_ignore": 0,
+                "rej_cup_latch": 0,
+                "rej_green_edge": 0,
+                "rej_jump": 0,
+                "rej_hole_center": 0,
+                "rej_pile": 0,
+                "candidates": 0,
+            }
+        )
 
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     lower = np.array([0, 0, params.v_min], dtype=np.uint8)
@@ -554,6 +572,8 @@ def find_ball(
             # When we have no previous position, only trust blobs inside the calibrated active-ball box.
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if debug_counts is not None:
+        debug_counts["contours"] = len(contours)
     (lx1, ly1), (lx2, ly2) = line_px
     cx_cup = cup_px[0] + cup_px[2] * 0.5
     cy_cup = cup_px[1] + cup_px[3] * 0.5
@@ -576,19 +596,27 @@ def find_ball(
     for c in contours:
         a = cv2.contourArea(c)
         if a < params.min_area or a > max_area:
+            if debug_counts is not None:
+                debug_counts["rej_area"] += 1
             continue
         peri = cv2.arcLength(c, True)
         if peri <= 1e-6:
             continue
         circ = 4.0 * math.pi * a / (peri * peri)
         if circ < params.min_circularity:
+            if debug_counts is not None:
+                debug_counts["rej_circularity"] += 1
             continue
         m = cv2.moments(c)
         if m["m00"] == 0:
+            if debug_counts is not None:
+                debug_counts["rej_moments"] += 1
             continue
         cx = m["m10"] / m["m00"]
         cy = m["m01"] / m["m00"]
         if ignore_near_cup is not None and point_in_rect((cx, cy), ignore_near_cup):
+            if debug_counts is not None:
+                debug_counts["rej_cup_ignore"] += 1
             continue
         # Ignore the rim/glare zone right after a make so it doesn't instantly re-count.
         if (
@@ -605,20 +633,28 @@ def find_ball(
                 ul = math.hypot(ux, uy) or 1e-6
                 cos_al = (ux * vx + uy * vy) / (ul * vl)
                 if cos_al < CUP_LATCH_COS_MIN:
+                    if debug_counts is not None:
+                        debug_counts["rej_cup_latch"] += 1
                     continue
         # Cup-rim latch: if a candidate appears "inside the cup box" but doesn't line up with recent motion,
         # we assume it's a rim/glare blob and reject it.
         if green_edge_line is not None and green_valid_sign is not None:
             ge1, ge2 = green_edge_line
             if green_valid_sign * line_side((cx, cy), ge1, ge2) <= 1e-3:
+                if debug_counts is not None:
+                    debug_counts["rej_green_edge"] += 1
                 continue
         # Optional mat edge filter: ignore floor/rocks on the invalid side of the orange line.
         if last_xy is not None:
             d = math.sqrt(dist_sq((cx, cy), last_xy))
             if d > max_jump_px:
+                if debug_counts is not None:
+                    debug_counts["rej_jump"] += 1
                 continue
             d_last_cup = math.hypot(last_xy[0] - cx_cup, last_xy[1] - cy_cup)
             if d_last_cup > approach_release and point_in_rect((cx, cy), hole_center_rect):
+                if debug_counts is not None:
+                    debug_counts["rej_hole_center"] += 1
                 continue
             # Before we are "close enough", avoid hole-center blobs that often come from glare/rim artifacts.
         score = circ * math.sqrt(a)
@@ -626,7 +662,12 @@ def find_ball(
 
     if ignore_pile_px is not None:
         pile_rect = expand_roi_xywh(ignore_pile_px, pile_pad, fw, fh)
+        before = len(candidates)
         candidates = [t for t in candidates if not point_in_rect(t[1], pile_rect)]
+        if debug_counts is not None:
+            debug_counts["rej_pile"] += max(0, before - len(candidates))
+    if debug_counts is not None:
+        debug_counts["candidates"] = len(candidates)
 
     if not candidates:
         return None
@@ -1090,6 +1131,7 @@ def main() -> None:
     miss_streak = 0
     jump_boost_frames = 0
     raw_positions: deque[tuple[float, float]] = deque(maxlen=12)
+    detector_debug: dict[str, int] = {}
 
     window = "Putting tracker (q quit, r reset stats)"
     print("q = quit | r = reset attempt/made counts")
@@ -1157,6 +1199,7 @@ def main() -> None:
                 green_edge_line=green_edge_line,
                 green_valid_sign=green_valid_sign,
                 motion_vel=motion_vel,
+                debug_counts=detector_debug,
             )
             if raw_ball is not None:
                 p1, p2 = line_px
@@ -1246,6 +1289,41 @@ def main() -> None:
                 cv2.line(vis, green_edge_line[0], green_edge_line[1], (255, 200, 100), 2)
             if smooth is not None:
                 cv2.circle(vis, (int(smooth[0]), int(smooth[1])), 10, (255, 0, 255), 2)
+
+            dbg_line = (
+                f"cnt:{detector_debug.get('contours', 0)} "
+                f"cand:{detector_debug.get('candidates', 0)} "
+                f"rej a:{detector_debug.get('rej_area', 0)} "
+                f"c:{detector_debug.get('rej_circularity', 0)} "
+                f"j:{detector_debug.get('rej_jump', 0)} "
+                f"h:{detector_debug.get('rej_hole_center', 0)}"
+            )
+            cv2.putText(
+                vis,
+                dbg_line,
+                (10, 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (220, 220, 220),
+                1,
+                cv2.LINE_AA,
+            )
+            dbg_line2 = (
+                f"rej cup:{detector_debug.get('rej_cup_ignore', 0)} "
+                f"latch:{detector_debug.get('rej_cup_latch', 0)} "
+                f"edge:{detector_debug.get('rej_green_edge', 0)} "
+                f"pile:{detector_debug.get('rej_pile', 0)}"
+            )
+            cv2.putText(
+                vis,
+                dbg_line2,
+                (10, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (220, 220, 220),
+                1,
+                cv2.LINE_AA,
+            )
 
             label = f"Attempts: {counter.attempts}  Made: {counter.made}"
             cv2.putText(
