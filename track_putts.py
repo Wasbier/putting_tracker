@@ -242,6 +242,7 @@ def calibrate_interactive(frame: np.ndarray, config_path: Path) -> None:
     )
     cv2.imshow("Calibrate", disp)
     cup = cv2.selectROI("Calibrate", frame, showCrosshair=True, fromCenter=False)
+    # Cup ROI is the anchor for both detection focus (near the hole) and the "made" dwell test.
     cup = (int(cup[0]), int(cup[1]), int(cup[2]), int(cup[3]))
     if cup[2] <= 0 or cup[3] <= 0:
         raise SystemExit("Cup ROI empty; try again.")
@@ -293,6 +294,7 @@ def calibrate_interactive(frame: np.ndarray, config_path: Path) -> None:
     )
     cv2.imshow("Calibrate", img3)
     pile = cv2.selectROI("Calibrate", frame, showCrosshair=True, fromCenter=False)
+    # Spare pile ROI is masked on re-acquire so the detector doesn't "grab" pile rocks instead of YOUR ball.
     pile_t = (int(pile[0]), int(pile[1]), int(pile[2]), int(pile[3]))
     ignore_pile = pile_t if pile_t[2] >= 8 and pile_t[3] >= 8 else None
 
@@ -319,6 +321,7 @@ def calibrate_interactive(frame: np.ndarray, config_path: Path) -> None:
     )
     cv2.imshow("Calibrate", img4)
     ab = cv2.selectROI("Calibrate", frame, showCrosshair=True, fromCenter=False)
+    # Active-ball ROI is used on re-acquire to prevent blur/morph from merging the pile into the mask.
     ab_t = (int(ab[0]), int(ab[1]), int(ab[2]), int(ab[3]))
     active_ball = ab_t if ab_t[2] >= 8 and ab_t[3] >= 8 else None
 
@@ -475,6 +478,7 @@ def find_ball(
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     lower = np.array([0, 0, params.v_min], dtype=np.uint8)
     upper = np.array([180, params.s_max, 255], dtype=np.uint8)
+    # HSV thresholding: isolates bright-ish, low-saturation blobs (the ball) from the mat.
     mask = cv2.inRange(hsv, lower, upper)
     # Drop obvious green turf (helps white ball pop on green)
     green = cv2.inRange(hsv, (35, 40, 40), (90, 255, 255))
@@ -484,12 +488,14 @@ def find_ball(
     mask = cv2.medianBlur(mask, 5)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    # Blur + morphology stabilizes blobs so circularity/area gating is less sensitive to noise.
 
     if scene_roi is not None:
         rx, ry, rw, rh = scene_roi
         roi_mask = np.zeros((fh, fw), dtype=np.uint8)
         roi_mask[ry : ry + rh, rx : rx + rw] = 255
         mask = cv2.bitwise_and(mask, roi_mask)
+        # Scene ROI keeps us from chasing blobs in the background (lights/sky).
 
     if last_xy is None and ignore_pile_px is not None:
         _zero_mask_rectangle(mask, ignore_pile_px, pile_pad)
@@ -503,6 +509,7 @@ def find_ball(
             zone_m = np.zeros((fh, fw), dtype=np.uint8)
             zone_m[yi : yi + hi, xi : xi + wi] = 255
             mask = cv2.bitwise_and(mask, zone_m)
+            # When we have no previous position, only trust blobs inside the calibrated active-ball box.
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     (lx1, ly1), (lx2, ly2) = line_px
@@ -541,6 +548,7 @@ def find_ball(
         cy = m["m01"] / m["m00"]
         if ignore_near_cup is not None and point_in_rect((cx, cy), ignore_near_cup):
             continue
+        # Ignore the rim/glare zone right after a make so it doesn't instantly re-count.
         if (
             last_xy is not None
             and motion_vel is not None
@@ -556,10 +564,13 @@ def find_ball(
                 cos_al = (ux * vx + uy * vy) / (ul * vl)
                 if cos_al < CUP_LATCH_COS_MIN:
                     continue
+        # Cup-rim latch: if a candidate appears "inside the cup box" but doesn't line up with recent motion,
+        # we assume it's a rim/glare blob and reject it.
         if green_edge_line is not None and green_valid_sign is not None:
             ge1, ge2 = green_edge_line
             if green_valid_sign * line_side((cx, cy), ge1, ge2) <= 1e-3:
                 continue
+        # Optional mat edge filter: ignore floor/rocks on the invalid side of the orange line.
         if last_xy is not None:
             d = math.sqrt(dist_sq((cx, cy), last_xy))
             if d > max_jump_px:
@@ -567,6 +578,7 @@ def find_ball(
             d_last_cup = math.hypot(last_xy[0] - cx_cup, last_xy[1] - cy_cup)
             if d_last_cup > approach_release and point_in_rect((cx, cy), hole_center_rect):
                 continue
+            # Before we are "close enough", avoid hole-center blobs that often come from glare/rim artifacts.
         score = circ * math.sqrt(a)
         candidates.append((score, (cx, cy)))
 
@@ -583,6 +595,8 @@ def find_ball(
         pred_x = lx + vx
         pred_y = ly + vy
 
+        # Choose the candidate closest to the predicted next position (motion continuity),
+        # rather than simply the "most circular" contour.
         def track_pick_key(t: tuple[float, tuple[float, float]]) -> tuple[float, float]:
             px, py = t[1]
             d_pred = dist_sq((px, py), (pred_x, pred_y))
@@ -730,6 +744,7 @@ class PuttCounter:
 
         prev_tee = self.tee_consecutive
         side_raw = line_side(ball, p1, p2)
+        # side > 0 means "front/cup side" (toward the hole). side < 0 means "tee side" (start side).
         side = cup_left_sign * side_raw
 
         if side < 0:
@@ -781,6 +796,7 @@ class PuttCounter:
                     else MIN_TEE_FRAMES_FIRST_STROKE
                 )
             ):
+            # Attempt: we only count a crossing after the ball has been on tee side for a while.
                 self.attempts += 1
                 self.counted_attempt_this_stroke = True
                 self.made_for_current_roll = False
@@ -819,6 +835,7 @@ class PuttCounter:
 
         if self.make_confirm_remaining is not None:
             if make_ok_base:
+                # Confirm after dwell: if the ball rolls past quickly, it should fail this phase.
                 self.make_confirm_remaining -= 1
                 if self.make_confirm_remaining <= 0:
                     if not self.counted_attempt_this_stroke:
@@ -833,6 +850,7 @@ class PuttCounter:
         elif make_ok_base:
             self.in_cup_frames += 1
             if self.in_cup_frames >= MADE_DWELL_FRAMES:
+                # First phase: short dwell inside the made ellipse before we arm confirmation.
                 self.make_confirm_remaining = MADE_CONFIRM_FRAMES
                 self.in_cup_frames = 0
         else:
@@ -866,6 +884,7 @@ class PuttCounter:
             self.tee_consecutive = 0
 
         if self.tee_consecutive >= MIN_ADDRESS_FRAMES_FOR_MADE:
+            # After we've sat on tee side for long enough, allow cup dwell to count as made.
             self.addressed_ok = True
 
 
@@ -982,6 +1001,7 @@ def main() -> None:
             counter.tick_timers()
             ignore_cup = cup_ignore_zone(cup_px) if counter.cup_suppress_frames > 0 else None
 
+            # Use recent motion to (a) cap jumps near the cup and (b) help candidate selection.
             motion_vel = _tail_velocity(raw_positions)
             effective_jump = max_jump * (2.35 if jump_boost_frames > 0 else 1.0)
             if last_ball is not None:
@@ -1011,6 +1031,8 @@ def main() -> None:
                 p1, p2 = line_px
                 tee_snap = False
                 if smooth is not None:
+                    # If raw sees the ball on tee side while smooth is still stuck cup-side,
+                    # snap smooth to raw so the next attempt can be detected.
                     s_raw = cup_left_sign * line_side(raw_ball, p1, p2)
                     s_sm = cup_left_sign * line_side(smooth, p1, p2)
                     d_rs = math.hypot(raw_ball[0] - smooth[0], raw_ball[1] - smooth[1])
@@ -1038,6 +1060,7 @@ def main() -> None:
                             alpha * raw_ball[1] + (1 - alpha) * smooth[1],
                         )
             else:
+                # No detection: count misses; if we're gone long enough, clear line memory / tracking state.
                 miss_streak += 1
                 if miss_streak > 8:
                     raw_positions.clear()
@@ -1055,6 +1078,8 @@ def main() -> None:
 
             ball_for_logic = smooth if smooth is not None and miss_streak <= hold_frames else None
             ball_speed = _avg_displacement_ppf(raw_positions)
+            # Logic runs on smoothed positions (so it doesn't jitter across the line),
+            # but speed comes from raw history so we can reject fast "roll past" transits.
             counter.update(
                 ball_for_logic,
                 cup_px,
@@ -1063,6 +1088,7 @@ def main() -> None:
                 ball_speed_ppf=ball_speed,
             )
             if counter.pull_tracker_reset() or counter.pull_reacquire():
+                # After a make (or a forced re-acquire), wipe tracking history so we don't keep old latches.
                 last_ball = None
                 smooth = None
                 miss_streak = 0
