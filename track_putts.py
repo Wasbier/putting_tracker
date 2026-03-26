@@ -653,9 +653,15 @@ def find_ball(
                 continue
             d_last_cup = math.hypot(last_xy[0] - cx_cup, last_xy[1] - cy_cup)
             if d_last_cup > approach_release and point_in_rect((cx, cy), hole_center_rect):
-                if debug_counts is not None:
-                    debug_counts["rej_hole_center"] += 1
-                continue
+                # If motion is heading into the cup, allow this candidate; otherwise treat as hole/rim artifact.
+                if motion_vel is not None:
+                    mvx, mvy = motion_vel
+                    to_cx, to_cy = cx_cup - last_xy[0], cy_cup - last_xy[1]
+                    if to_cx * mvx + to_cy * mvy <= 0:
+                        if debug_counts is not None:
+                            debug_counts["rej_hole_center"] += 1
+                        continue
+                # No reliable motion direction -> do NOT block; better to keep ball continuity near cup.
             # Before we are "close enough", avoid hole-center blobs that often come from glare/rim artifacts.
         score = circ * math.sqrt(a)
         candidates.append((score, (cx, cy)))
@@ -700,7 +706,16 @@ def find_ball(
         )
 
     if active_ball_px is not None:
-        return min(candidates, key=init_key)[1]
+        # Re-acquire should lock to the calibrated ball-address spot, not any incidental blob (toe/club).
+        ax, ay, aw, ah = active_ball_px
+        ab_center = (ax + aw * 0.5, ay + ah * 0.5)
+
+        def active_key(t: tuple[float, tuple[float, float]]) -> tuple[float, float, float]:
+            px, py = t[1]
+            # Primary: closest to active-ball center. Secondary: better contour score.
+            return (dist_sq((px, py), ab_center), -t[0], abs(py - ab_center[1]))
+
+        return min(candidates, key=active_key)[1]
 
     # Init: prefer tee side of line; among those, closest to address.
     p1, p2 = (lx1, ly1), (lx2, ly2)
@@ -1240,6 +1255,11 @@ def main() -> None:
                     raw_positions.clear()
                 if miss_streak > hold_frames:
                     counter.clear_line_memory()
+                # If tracking goes stale for a while, force re-acquire so we don't stay latched to cup/leaf.
+                if active_ball_px is not None and miss_streak > 18:
+                    last_ball = None
+                    smooth = None
+                    jump_boost_frames = max(jump_boost_frames, 20)
                 if counter.made_for_current_roll and miss_streak > 14:
                     last_ball = None
                     smooth = None
