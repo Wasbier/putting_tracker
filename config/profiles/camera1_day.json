@@ -1,0 +1,54 @@
+{
+  "cup": {
+    "x": 0.6807291666666667,
+    "y": 0.8898148148148148,
+    "w": 0.036458333333333336,
+    "h": 0.03518518518518519
+  },
+  "line": {
+    "x1": 0.384375,
+    "y1": 0.8611111111111112,
+    "x2": 0.38385416666666666,
+    "y2": 0.9083333333333333
+  },
+  "ignore_pile": {
+    "x": 0.2875,
+    "y": 0.8814814814814815,
+    "w": 0.03958333333333333,
+    "h": 0.037037037037037035
+  },
+  "active_ball": {
+    "x": 0.35520833333333335,
+    "y": 0.8638888888888889,
+    "w": 0.03697916666666667,
+    "h": 0.03518518518518519
+  },
+  "green_edge": {
+    "x1": 0.1484375,
+    "y1": 0.8175925925925925,
+    "x2": 0.990625,
+    "y2": 0.85
+  },
+  "detector": {
+    "v_min": 95,
+    "s_max": 130,
+    "min_area": 40,
+    "min_circularity": 0.52,
+    "max_area_frac": 0.002857142857142857
+  },
+  "logic": {
+    "min_tee_frames_for_stroke": 22,
+    "min_tee_frames_first_stroke": 10,
+    "frames_on_tee_to_arm_next_make": 10,
+    "min_address_frames_for_made": 10,
+    "made_axis_rx_frac": 0.42,
+    "made_axis_ry_frac": 0.28,
+    "cup_inner_margin_frac": 0.17,
+    "made_max_speed_ppf": 8.5,
+    "made_dwell_frames": 5,
+    "made_confirm_frames": 8,
+    "made_confirm_max_none_frames": 5,
+    "post_attempt_cup_stall_frames": 52,
+    "post_attempt_stall_max_speed_ppf": 4.8
+  }
+}

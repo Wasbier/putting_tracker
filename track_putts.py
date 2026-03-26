@@ -40,6 +40,31 @@ import numpy as np
 from capture_utils import open_capture
 
 CONFIG_NAME = "tracking_config.json"
+DEFAULT_PROFILES_DIR = Path("config/profiles")
+
+DEFAULT_DETECTOR_CFG: dict[str, float] = {
+    "v_min": 90.0,
+    "s_max": 120.0,
+    "min_area": 40.0,
+    "min_circularity": 0.52,
+    "max_area_frac": 1.0 / 350.0,
+}
+
+DEFAULT_LOGIC_CFG: dict[str, float] = {
+    "min_tee_frames_for_stroke": 22.0,
+    "min_tee_frames_first_stroke": 10.0,
+    "frames_on_tee_to_arm_next_make": 10.0,
+    "min_address_frames_for_made": 10.0,
+    "made_axis_rx_frac": 0.42,
+    "made_axis_ry_frac": 0.28,
+    "cup_inner_margin_frac": 0.17,
+    "made_max_speed_ppf": 8.5,
+    "made_dwell_frames": 5.0,
+    "made_confirm_frames": 8.0,
+    "made_confirm_max_none_frames": 5.0,
+    "post_attempt_cup_stall_frames": 52.0,
+    "post_attempt_stall_max_speed_ppf": 4.8,
+}
 
 
 # --- geometry ---
@@ -137,6 +162,15 @@ def scene_roi_from_calibration(
     return (x0, y0, x1 - x0, y1 - y0)
 
 
+def _merge_numeric_settings(defaults: dict[str, float], raw: Any) -> dict[str, float]:
+    out = defaults.copy()
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if k in out and isinstance(v, (int, float)):
+                out[k] = float(v)
+    return out
+
+
 def load_config(path: Path, frame_w: int, frame_h: int) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     px = _norm_to_px(data, frame_w, frame_h)
@@ -176,6 +210,8 @@ def load_config(path: Path, frame_w: int, frame_h: int) -> dict[str, Any]:
         if abs(sge) >= 3.0:
             green_edge_line = (e1, e2)
             green_valid_sign = 1.0 if sge > 0 else -1.0
+    detector_cfg = _merge_numeric_settings(DEFAULT_DETECTOR_CFG, data.get("detector"))
+    logic_cfg = _merge_numeric_settings(DEFAULT_LOGIC_CFG, data.get("logic"))
     out: dict[str, Any] = {
         "cup_px": c,
         "line_px": (p1, p2),
@@ -185,6 +221,8 @@ def load_config(path: Path, frame_w: int, frame_h: int) -> dict[str, Any]:
         "active_ball_px": active_ball,
         "green_edge_line": green_edge_line,
         "green_valid_sign": green_valid_sign,
+        "detector_cfg": detector_cfg,
+        "logic_cfg": logic_cfg,
     }
     return out
 
@@ -198,6 +236,8 @@ def save_config_norm(
     ignore_pile_roi: tuple[int, int, int, int] | None = None,
     active_ball_roi: tuple[int, int, int, int] | None = None,
     green_edge_pts: tuple[tuple[int, int], tuple[int, int]] | None = None,
+    detector_cfg: dict[str, float] | None = None,
+    logic_cfg: dict[str, float] | None = None,
 ) -> None:
     x, y, rw, rh = cup_roi
     (x1, y1), (x2, y2) = line_pts
@@ -221,6 +261,8 @@ def save_config_norm(
             "x2": gx2 / w,
             "y2": gy2 / h,
         }
+    data["detector"] = _merge_numeric_settings(DEFAULT_DETECTOR_CFG, detector_cfg)
+    data["logic"] = _merge_numeric_settings(DEFAULT_LOGIC_CFG, logic_cfg)
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
@@ -917,6 +959,45 @@ def _avg_displacement_ppf(positions: deque[tuple[float, float]]) -> float | None
     return total / (len(pts) - 1)
 
 
+def _apply_logic_cfg(logic_cfg: dict[str, float]) -> None:
+    """Apply per-profile logic settings to runtime globals."""
+    global MIN_TEE_FRAMES_FOR_STROKE
+    global MIN_TEE_FRAMES_FIRST_STROKE
+    global FRAMES_ON_TEE_TO_ARM_NEXT_MAKE
+    global MIN_ADDRESS_FRAMES_FOR_MADE
+    global MADE_AXIS_RX_FRAC
+    global MADE_AXIS_RY_FRAC
+    global CUP_INNER_MARGIN_FRAC
+    global MADE_MAX_SPEED_PPF
+    global MADE_DWELL_FRAMES
+    global MADE_CONFIRM_FRAMES
+    global MADE_CONFIRM_MAX_NONE_FRAMES
+    global POST_ATTEMPT_CUP_STALL_FRAMES
+    global POST_ATTEMPT_STALL_MAX_SPEED_PPF
+
+    MIN_TEE_FRAMES_FOR_STROKE = int(logic_cfg["min_tee_frames_for_stroke"])
+    MIN_TEE_FRAMES_FIRST_STROKE = int(logic_cfg["min_tee_frames_first_stroke"])
+    FRAMES_ON_TEE_TO_ARM_NEXT_MAKE = int(logic_cfg["frames_on_tee_to_arm_next_make"])
+    MIN_ADDRESS_FRAMES_FOR_MADE = int(logic_cfg["min_address_frames_for_made"])
+    MADE_AXIS_RX_FRAC = float(logic_cfg["made_axis_rx_frac"])
+    MADE_AXIS_RY_FRAC = float(logic_cfg["made_axis_ry_frac"])
+    CUP_INNER_MARGIN_FRAC = float(logic_cfg["cup_inner_margin_frac"])
+    MADE_MAX_SPEED_PPF = float(logic_cfg["made_max_speed_ppf"])
+    MADE_DWELL_FRAMES = int(logic_cfg["made_dwell_frames"])
+    MADE_CONFIRM_FRAMES = int(logic_cfg["made_confirm_frames"])
+    MADE_CONFIRM_MAX_NONE_FRAMES = int(logic_cfg["made_confirm_max_none_frames"])
+    POST_ATTEMPT_CUP_STALL_FRAMES = int(logic_cfg["post_attempt_cup_stall_frames"])
+    POST_ATTEMPT_STALL_MAX_SPEED_PPF = float(logic_cfg["post_attempt_stall_max_speed_ppf"])
+
+
+def _infer_profile_tag(frame_bgr: np.ndarray) -> tuple[str, float]:
+    """Simple day/night split from scene brightness."""
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    med = float(np.median(gray))
+    tag = "day" if med >= 78.0 else "night"
+    return tag, med
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Track putts from webcam or video")
     g = p.add_mutually_exclusive_group(required=True)
@@ -928,6 +1009,23 @@ def main() -> None:
         type=Path,
         default=Path(CONFIG_NAME),
         help=f"Calibration JSON (default: {CONFIG_NAME})",
+    )
+    p.add_argument(
+        "--profile",
+        choices=["day", "night", "auto"],
+        help="Use profile config from --profiles-dir and --camera-id (overrides --config).",
+    )
+    p.add_argument(
+        "--camera-id",
+        type=str,
+        default="camera1",
+        help="Profile camera name for --profile mode (default: camera1).",
+    )
+    p.add_argument(
+        "--profiles-dir",
+        type=Path,
+        default=DEFAULT_PROFILES_DIR,
+        help=f"Profile configs directory (default: {DEFAULT_PROFILES_DIR}).",
     )
     p.add_argument("--calibrate", action="store_true", help="Draw cup ROI + start line, save config")
     p.add_argument(
@@ -943,13 +1041,26 @@ def main() -> None:
         raise SystemExit("Could not read first frame.")
     fh, fw = frame0.shape[:2]
 
+    config_path = args.config
+    selected_profile: str | None = None
+    if args.profile is not None:
+        if args.profile == "auto":
+            if args.calibrate:
+                raise SystemExit("Use --profile day/night for calibration (auto is runtime-only).")
+            selected_profile, med = _infer_profile_tag(frame0)
+            print(f"Auto profile: median gray {med:.1f} -> {selected_profile}")
+        else:
+            selected_profile = args.profile
+        config_path = args.profiles_dir / f"{args.camera_id}_{selected_profile}.json"
+        print(f"Profile config: {config_path}")
+
     if args.calibrate:
-        calibrate_interactive(frame0, args.config)
+        calibrate_interactive(frame0, config_path)
 
-    if not args.config.is_file():
-        raise SystemExit(f"Missing {args.config}; run once with --calibrate")
+    if not config_path.is_file():
+        raise SystemExit(f"Missing {config_path}; run once with --calibrate")
 
-    cfg = load_config(args.config, fw, fh)
+    cfg = load_config(config_path, fw, fh)
     cup_px = cfg["cup_px"]
     line_px = cfg["line_px"]
     cup_left_sign = cfg["cup_left_sign"]
@@ -958,11 +1069,20 @@ def main() -> None:
     active_ball_px: tuple[int, int, int, int] | None = cfg.get("active_ball_px")
     green_edge_line: tuple[tuple[int, int], tuple[int, int]] | None = cfg.get("green_edge_line")
     green_valid_sign: float | None = cfg.get("green_valid_sign")
+    detector_cfg: dict[str, float] = cfg.get("detector_cfg", DEFAULT_DETECTOR_CFG.copy())
+    logic_cfg: dict[str, float] = cfg.get("logic_cfg", DEFAULT_LOGIC_CFG.copy())
+    _apply_logic_cfg(logic_cfg)
     max_jump = max(36.0, min(fw, fh) * 0.11)
     hold_frames = 12
     lose_track_frames = hold_frames * 8
 
-    detector = DetectorParams()
+    detector = DetectorParams(
+        v_min=int(detector_cfg["v_min"]),
+        s_max=int(detector_cfg["s_max"]),
+        min_area=int(detector_cfg["min_area"]),
+        min_circularity=float(detector_cfg["min_circularity"]),
+        max_area_frac=float(detector_cfg["max_area_frac"]),
+    )
     counter = PuttCounter()
     last_ball: tuple[float, float] | None = None
     smooth: tuple[float, float] | None = None
@@ -974,6 +1094,17 @@ def main() -> None:
     window = "Putting tracker (q quit, r reset stats)"
     print("q = quit | r = reset attempt/made counts")
     print(f"Tracking zone from calibration; max jump {max_jump:.0f}px — cyan box")
+    print(
+        "detector:"
+        f" v_min={detector.v_min} s_max={detector.s_max}"
+        f" min_area={detector.min_area} min_circ={detector.min_circularity:.2f}"
+    )
+    print(
+        "logic:"
+        f" made_speed<={MADE_MAX_SPEED_PPF:.1f}"
+        f" dwell={MADE_DWELL_FRAMES} confirm={MADE_CONFIRM_FRAMES}"
+        f" ellipse=({MADE_AXIS_RX_FRAC:.2f},{MADE_AXIS_RY_FRAC:.2f})"
+    )
     if ignore_pile_px is not None:
         print("ignore_pile ROI active (masked on re-acquire)")
     if active_ball_px is not None:
