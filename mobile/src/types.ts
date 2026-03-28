@@ -1,5 +1,13 @@
 export type PuttOutcome = "made" | "miss";
 
+/** Snapshot from putting_ws_server (Tapo stream on PC). */
+export interface LiveState {
+  attempts: number;
+  made: number;
+  missed: number;
+  putt_sequence: string[];
+}
+
 export interface Session {
   id: string;
   startedAt: string;

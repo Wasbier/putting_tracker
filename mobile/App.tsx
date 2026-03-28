@@ -7,12 +7,14 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 import HistoryScreen from "./src/screens/HistoryScreen";
 import PracticeScreen from "./src/screens/PracticeScreen";
 import RecordScreen from "./src/screens/RecordScreen";
+import { TrackerSocketProvider } from "./src/TrackerSocketContext";
 
 const Tab = createBottomTabNavigator();
 
 export default function App() {
   return (
     <SafeAreaProvider>
+      <TrackerSocketProvider>
       <NavigationContainer>
         <StatusBar style="light" />
         <Tab.Navigator
@@ -50,6 +52,7 @@ export default function App() {
           />
         </Tab.Navigator>
       </NavigationContainer>
+      </TrackerSocketProvider>
     </SafeAreaProvider>
   );
 }

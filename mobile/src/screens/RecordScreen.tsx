@@ -14,12 +14,14 @@ import {
   moveRecordingFromCache,
   type RecordingFile,
 } from "../recordings";
+import { useTrackerSocket } from "../TrackerSocketContext";
 
 const green = "#0d4f2b";
 const cream = "#f4f1e8";
 const missRed = "#c44c4c";
 
 export default function RecordScreen() {
+  const { connected, live } = useTrackerSocket();
   const [permission, requestPermission] = useCameraPermissions();
   const [mode, setMode] = useState<"list" | "camera">("list");
   const [recordings, setRecordings] = useState<RecordingFile[]>([]);
@@ -115,6 +117,27 @@ export default function RecordScreen() {
           >
             <Text style={styles.backBtnText}>← Close</Text>
           </Pressable>
+          {recording ? (
+            <View style={styles.liveBanner}>
+              {connected && live ? (
+                <>
+                  <Text style={styles.liveBannerTitle}>Live (Tapo on PC)</Text>
+                  <View style={styles.liveBannerRow}>
+                    <Text style={styles.liveStat}>
+                      A {live.attempts}
+                    </Text>
+                    <Text style={styles.liveStat}>M {live.made}</Text>
+                    <Text style={styles.liveStatMiss}>X {live.missed}</Text>
+                  </View>
+                </>
+              ) : (
+                <Text style={styles.liveBannerOffline}>
+                  Connect on Practice (same Wi‑Fi) to see live putt counts from your
+                  Tapo stream while you record here.
+                </Text>
+              )}
+            </View>
+          ) : null}
           <View style={styles.cameraFooter}>
             {saving ? (
               <ActivityIndicator color={cream} size="large" />
@@ -132,8 +155,8 @@ export default function RecordScreen() {
               </Pressable>
             )}
             <Text style={styles.cameraHint}>
-              Clips save on this device. Analyze later with desktop track_putts.py
-              on the file (copy from phone storage).
+              Phone clip is separate from the Tapo feed. With Practice connected,
+              counts above are from the PC tracker, not from this camera.
             </Text>
           </View>
         </SafeAreaView>
@@ -145,8 +168,8 @@ export default function RecordScreen() {
     <SafeAreaView style={styles.container} edges={["top", "bottom"]}>
       <Text style={styles.title}>Record</Text>
       <Text style={styles.sub}>
-        Capture practice video for offline analysis. On-device auto scoring comes
-        later.
+        Film on the phone for your own clips. If you connect on Practice first,
+        live putt counts from the Tapo stream appear on screen while recording.
       </Text>
 
       <Pressable style={styles.primaryBtn} onPress={openCamera}>
@@ -233,6 +256,45 @@ const styles = StyleSheet.create({
   cameraOverlay: {
     flex: 1,
     justifyContent: "space-between",
+  },
+  liveBanner: {
+    alignSelf: "center",
+    marginTop: 8,
+    backgroundColor: "rgba(0,0,0,0.65)",
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    maxWidth: "92%",
+  },
+  liveBannerTitle: {
+    color: cream,
+    fontSize: 11,
+    fontWeight: "600",
+    opacity: 0.85,
+    marginBottom: 6,
+    textAlign: "center",
+  },
+  liveBannerRow: {
+    flexDirection: "row",
+    justifyContent: "center",
+    gap: 20,
+  },
+  liveStat: {
+    color: cream,
+    fontSize: 20,
+    fontWeight: "700",
+  },
+  liveStatMiss: {
+    color: missRed,
+    fontSize: 20,
+    fontWeight: "700",
+  },
+  liveBannerOffline: {
+    color: cream,
+    fontSize: 12,
+    lineHeight: 17,
+    textAlign: "center",
+    opacity: 0.9,
   },
   backBtn: {
     alignSelf: "flex-start",
