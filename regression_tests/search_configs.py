@@ -9,9 +9,14 @@ Usage (from repo root):
   python regression_tests/search_configs.py --trials 400
   python regression_tests/search_configs.py --case night_profile_test1_baseline --trials 800
   python regression_tests/search_configs.py --max-matches 5 --trials 2000
+  python regression_tests/search_configs.py --no-progress   # plain log lines (no tqdm bar)
 
 Output: regression_tests/search_results/<case_name>/match_<n>.json
 Each file is a complete calibration JSON (geometry preserved from the base profile).
+
+Trial 0 for each case is always the unmodified base profile. Random trials also include
+the base value for every tuned key in each parameter's choice pool (so e.g. max_area_frac
+1/350 is reachable even if not in the fixed grid).
 """
 
 from __future__ import annotations
@@ -24,6 +29,8 @@ import sys
 import tempfile
 from copy import deepcopy
 from pathlib import Path
+
+from tqdm import tqdm
 
 # Discrete search space (widen/tighten as needed).
 DETECTOR_CHOICES: dict[str, list[float | int]] = {
@@ -80,17 +87,51 @@ def _normalize_detector_value(key: str, v: float | int) -> float | int:
     return float(v)
 
 
+def _dedupe_normalized_detector(key: str, pool: list[float | int]) -> list[float | int]:
+    seen: set[float | int] = set()
+    out: list[float | int] = []
+    for v in pool:
+        n = _normalize_detector_value(key, v)
+        sig: float | int = round(float(n), 12) if key == "max_area_frac" else n
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(n)
+    return out
+
+
+def _dedupe_normalized_logic(key: str, pool: list[float | int]) -> list[float | int]:
+    seen: set[float | int] = set()
+    out: list[float | int] = []
+    for v in pool:
+        n = _normalize_logic_value(key, v)
+        sig: float | int = round(float(n), 9) if isinstance(n, float) else n
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(n)
+    return out
+
+
 def sample_profile_settings(rng: random.Random, base: dict[str, object]) -> dict[str, object]:
     """Return a deep copy of base with randomized detector/logic blocks."""
     cfg = deepcopy(base)
     det = dict(cfg.get("detector", {})) if isinstance(cfg.get("detector"), dict) else {}
     for k, choices in DETECTOR_CHOICES.items():
-        det[k] = _normalize_detector_value(k, rng.choice(choices))
+        pool = list(choices)
+        if k in det:
+            pool.append(det[k])
+        pool = _dedupe_normalized_detector(k, pool)
+        det[k] = rng.choice(pool)
     cfg["detector"] = det
 
     log = dict(cfg.get("logic", {})) if isinstance(cfg.get("logic"), dict) else {}
     for k, choices in LOGIC_CHOICES.items():
-        log[k] = _normalize_logic_value(k, rng.choice(choices))
+        pool = list(choices)
+        if k in log:
+            pool.append(log[k])
+        pool = _dedupe_normalized_logic(k, pool)
+        log[k] = rng.choice(pool)
     cfg["logic"] = log
     return cfg
 
@@ -172,6 +213,11 @@ def main() -> int:
         default=None,
         help="Output root (default: regression_tests/search_results)",
     )
+    ap.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the tqdm progress bar",
+    )
     args = ap.parse_args()
 
     repo_root = _repo_root()
@@ -217,44 +263,63 @@ def main() -> int:
         matches = 0
         print(f"=== {name} (base {base_path.name}) — {args.trials} trials ===")
 
-        for t in range(args.trials):
-            sampled = sample_profile_settings(rng, base_data)
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                suffix=".json",
-                delete=False,
-                encoding="utf-8",
-            ) as tf:
-                cfg_path = Path(tf.name)
-                json.dump(sampled, tf, indent=2)
+        trial_iter = range(args.trials)
+        if not args.no_progress:
+            trial_iter = tqdm(
+                trial_iter,
+                total=args.trials,
+                desc=name[:48],
+                unit="trial",
+                file=sys.stdout,
+                leave=True,
+            )
+
+        for t in trial_iter:
             try:
-                report = run_tracker(repo_root, cfg_path, video, args.scale)
+                # Trial 0 = exact base profile (often not in the discrete grids, e.g. max_area_frac 1/350).
+                sampled = (
+                    deepcopy(base_data) if t == 0 else sample_profile_settings(rng, base_data)
+                )
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    suffix=".json",
+                    delete=False,
+                    encoding="utf-8",
+                ) as tf:
+                    cfg_path = Path(tf.name)
+                    json.dump(sampled, tf, indent=2)
+                try:
+                    report = run_tracker(repo_root, cfg_path, video, args.scale)
+                finally:
+                    cfg_path.unlink(missing_ok=True)
+
+                if report is None or not report_matches_case(report, case):
+                    continue
+
+                matches += 1
+                out_path = out_dir / f"match_{matches:04d}.json"
+                try:
+                    base_rel = str(base_path.resolve().relative_to(repo_root.resolve()))
+                except ValueError:
+                    base_rel = str(base_path)
+                payload = {
+                    "meta": {
+                        "case": name,
+                        "trial_index": t,
+                        "video": video,
+                        "profile_base": base_rel,
+                        "report": report,
+                    },
+                    "config": sampled,
+                }
+                out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                msg = f"  match {matches}: trial {t} -> {out_path.relative_to(repo_root)}"
+                tqdm.write(msg) if not args.no_progress else print(msg)
+                if args.max_matches > 0 and matches >= args.max_matches:
+                    break
             finally:
-                cfg_path.unlink(missing_ok=True)
-
-            if report is None or not report_matches_case(report, case):
-                continue
-
-            matches += 1
-            out_path = out_dir / f"match_{matches:04d}.json"
-            try:
-                base_rel = str(base_path.resolve().relative_to(repo_root.resolve()))
-            except ValueError:
-                base_rel = str(base_path)
-            payload = {
-                "meta": {
-                    "case": name,
-                    "trial_index": t,
-                    "video": video,
-                    "profile_base": base_rel,
-                    "report": report,
-                },
-                "config": sampled,
-            }
-            out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            print(f"  match {matches}: trial {t} -> {out_path.relative_to(repo_root)}")
-            if args.max_matches > 0 and matches >= args.max_matches:
-                break
+                if isinstance(trial_iter, tqdm):
+                    trial_iter.set_postfix(matches=matches)
 
         if matches == 0:
             print(f"  No matches in {args.trials} trials (try more trials or widen search space).")

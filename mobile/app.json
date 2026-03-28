@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "Putting Tracker",
+    "slug": "putting-tracker",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "putting-tracker",
+    "userInterfaceStyle": "automatic",
+    "icon": "./assets/icon.png",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0d4f2b"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.puttingtracker.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Record putting practice videos for later analysis with the desktop tracker.",
+        "NSMicrophoneUsageDescription": "Optional audio when recording practice videos."
+      }
+    },
+    "android": {
+      "package": "com.puttingtracker.app",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#0d4f2b"
+      },
+      "permissions": [
+        "CAMERA",
+        "RECORD_AUDIO",
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Putting Tracker to use the camera to record practice videos.",
+          "microphonePermission": "Allow the microphone when recording video (optional).",
+          "recordAudioAndroid": true
+        }
+      ]
+    ]
+  }
+}

@@ -3,3 +3,10 @@ videos/
 logs/
 __pycache__/
 *.pyc
+
+# Mobile (Expo / React Native)
+mobile/node_modules/
+mobile/.expo/
+mobile/dist/
+mobile/npm-debug.*
+mobile/*.log
