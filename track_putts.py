@@ -30,7 +30,7 @@ import json
 import math
 import sys
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -787,6 +787,9 @@ class PuttCounter:
     make_confirm_none_streak: int = 0
     pending_reacquire: bool = False
     post_attempt_cup_stall: int = 0
+    # Order of outcomes for completed strokes (for regression / tuning).
+    putt_outcomes: list[str] = field(default_factory=list)
+    made_recorded_this_stroke: bool = False
 
     def clear_line_memory(self) -> None:
         self.last_side = None
@@ -806,6 +809,12 @@ class PuttCounter:
             return False
         self.pending_reacquire = False
         return True
+
+    def finalize_putt_outcomes(self) -> None:
+        """Close the last stroke if the video ended before a following line cross (miss)."""
+        gap = self.attempts - len(self.putt_outcomes)
+        for _ in range(max(0, gap)):
+            self.putt_outcomes.append("miss")
 
     def _on_make_registered(self) -> None:
         self.made_for_current_roll = True
@@ -895,6 +904,9 @@ class PuttCounter:
                 )
             ):
             # Attempt: we only count a crossing after the ball has been on tee side for a while.
+                if self.attempts > 0 and not self.made_recorded_this_stroke:
+                    self.putt_outcomes.append("miss")
+                self.made_recorded_this_stroke = False
                 self.attempts += 1
                 self.counted_attempt_this_stroke = True
                 self.made_for_current_roll = False
@@ -940,6 +952,8 @@ class PuttCounter:
                         self.attempts += 1
                         self.counted_attempt_this_stroke = True
                     self.made += 1
+                    self.putt_outcomes.append("made")
+                    self.made_recorded_this_stroke = True
                     self._on_make_registered()
             else:
                 # Left the made zone or sped up — rolled past, not holed out.
@@ -1097,7 +1111,7 @@ def main() -> None:
     p.add_argument(
         "--report-json",
         type=Path,
-        help="Optional output path for final summary JSON (attempts/made/missed/profile/config).",
+        help="Optional output path for final summary JSON (attempts/made/missed/putt_sequence/profile/config).",
     )
     args = p.parse_args()
 
@@ -1392,10 +1406,12 @@ def main() -> None:
         if not args.headless:
             cv2.destroyAllWindows()
 
+    counter.finalize_putt_outcomes()
     summary = {
         "attempts": int(counter.attempts),
         "made": int(counter.made),
         "missed": int(counter.attempts - counter.made),
+        "putt_sequence": list(counter.putt_outcomes),
         "profile": selected_profile,
         "config": str(config_path),
     }

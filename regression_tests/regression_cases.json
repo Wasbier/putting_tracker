@@ -1,12 +1,32 @@
 {
   "cases": [
+    
+    {
+      "name": "night_profile_test1_baseline",
+      "video": "videos/training_videos/test_1_night.mp4",
+      "profile": "night",
+      "camera_id": "camera1",
+      "expected_attempts": 4,
+      "expected_made": 2,
+      "expected_sequence": ["made", "miss", "made", "miss"]
+    },
+    {
+      "name": "night_profile_test2_baseline",
+      "video": "videos/training_videos/test_2_night.mp4",
+      "profile": "night",
+      "camera_id": "camera1",
+      "expected_attempts": 4,
+      "expected_made": 2,
+      "expected_sequence": ["miss", "made", "made", "miss"]
+    },
     {
       "name": "day_profile_test3_baseline",
       "video": "videos/training_videos/test_3_day.mp4",
       "profile": "day",
       "camera_id": "camera1",
       "expected_attempts": 4,
-      "expected_made": 2
+      "expected_made": 2,
+      "expected_sequence": ["made", "made", "miss", "miss"]
     }
   ]
 }

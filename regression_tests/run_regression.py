@@ -51,11 +51,21 @@ def run_case(repo_root: Path, case: dict[str, object]) -> tuple[bool, str]:
     got_attempts = int(report["attempts"])
     got_made = int(report["made"])
     ok = got_attempts == expected_attempts and got_made == expected_made
+    exp_seq = case.get("expected_sequence")
+    if exp_seq is not None:
+        got_seq = report.get("putt_sequence")
+        if not isinstance(got_seq, list) or [str(x) for x in got_seq] != [
+            str(x) for x in exp_seq
+        ]:
+            ok = False
     status = "PASS" if ok else "FAIL"
     msg = (
         f"[{status}] {name}: attempts {got_attempts}/{expected_attempts}, "
         f"made {got_made}/{expected_made}"
     )
+    if exp_seq is not None:
+        got_seq = report.get("putt_sequence")
+        msg += f", sequence {got_seq!r} vs {exp_seq!r}"
     return ok, msg
 
 
