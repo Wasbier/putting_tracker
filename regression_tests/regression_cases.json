@@ -1,0 +1,12 @@
+{
+  "cases": [
+    {
+      "name": "day_profile_test3_baseline",
+      "video": "videos/training_videos/test_3_day.mp4",
+      "profile": "day",
+      "camera_id": "camera1",
+      "expected_attempts": 4,
+      "expected_made": 2
+    }
+  ]
+}

@@ -1089,6 +1089,16 @@ def main() -> None:
         action="store_true",
         help="When the video ends, stop on the last frame instead of restarting (counts are not reset).",
     )
+    p.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run without window/keyboard (useful for automated regression checks).",
+    )
+    p.add_argument(
+        "--report-json",
+        type=Path,
+        help="Optional output path for final summary JSON (attempts/made/missed/profile/config).",
+    )
     args = p.parse_args()
 
     cap = open_capture(args.camera, args.video)
@@ -1149,6 +1159,7 @@ def main() -> None:
     detector_debug: dict[str, int] = {}
 
     window = "Putting tracker (q quit, r reset stats)"
+    effective_no_loop = args.no_loop or args.headless
     print("q = quit | r = reset attempt/made counts")
     print(f"Tracking zone from calibration; max jump {max_jump:.0f}px — cyan box")
     print(
@@ -1175,7 +1186,7 @@ def main() -> None:
         while True:
             ok, frame = cap.read()
             if not ok or frame is None:
-                if args.video and not args.no_loop:
+                if args.video and not effective_no_loop:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     counter = PuttCounter()
                     last_ball = None
@@ -1357,27 +1368,44 @@ def main() -> None:
                 cv2.LINE_AA,
             )
 
-            disp = vis
-            if args.scale != 1.0:
-                disp = cv2.resize(
-                    vis,
-                    None,
-                    fx=args.scale,
-                    fy=args.scale,
-                    interpolation=cv2.INTER_AREA,
-                )
-            cv2.imshow(window, disp)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            if key == ord("r"):
-                counter = PuttCounter()
-                last_ball = None
-                smooth = None
-                raw_positions.clear()
+            if not args.headless:
+                disp = vis
+                if args.scale != 1.0:
+                    disp = cv2.resize(
+                        vis,
+                        None,
+                        fx=args.scale,
+                        fy=args.scale,
+                        interpolation=cv2.INTER_AREA,
+                    )
+                cv2.imshow(window, disp)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                if key == ord("r"):
+                    counter = PuttCounter()
+                    last_ball = None
+                    smooth = None
+                    raw_positions.clear()
     finally:
         cap.release()
-        cv2.destroyAllWindows()
+        if not args.headless:
+            cv2.destroyAllWindows()
+
+    summary = {
+        "attempts": int(counter.attempts),
+        "made": int(counter.made),
+        "missed": int(counter.attempts - counter.made),
+        "profile": selected_profile,
+        "config": str(config_path),
+    }
+    print(
+        f"Final summary: attempts={summary['attempts']} "
+        f"made={summary['made']} missed={summary['missed']}"
+    )
+    if args.report_json is not None:
+        args.report_json.parent.mkdir(parents=True, exist_ok=True)
+        args.report_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
