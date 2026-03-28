@@ -49,6 +49,8 @@
     "made_confirm_frames": 8,
     "made_confirm_max_none_frames": 5,
     "post_attempt_cup_stall_frames": 52,
-    "post_attempt_stall_max_speed_ppf": 4.8
+    "post_attempt_stall_max_speed_ppf": 4.8,
+    "recover_made_zone_jump_frac": 0.5,
+    "recover_min_miss_streak": 4
   }
 }

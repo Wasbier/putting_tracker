@@ -51,6 +51,7 @@ LOGIC_INT_KEYS = frozenset(
         "made_confirm_frames",
         "made_confirm_max_none_frames",
         "post_attempt_cup_stall_frames",
+        "recover_min_miss_streak",
     }
 )
 
@@ -68,6 +69,8 @@ LOGIC_CHOICES: dict[str, list[float | int]] = {
     "made_confirm_max_none_frames": [3, 4, 5, 6, 8],
     "post_attempt_cup_stall_frames": [36, 44, 52, 60, 72],
     "post_attempt_stall_max_speed_ppf": [3.5, 4.2, 4.8, 5.5, 6.2],
+    "recover_made_zone_jump_frac": [0.42, 0.46, 0.5, 0.54, 0.58],
+    "recover_min_miss_streak": [3, 4, 5, 6, 8, 99],
 }
 
 

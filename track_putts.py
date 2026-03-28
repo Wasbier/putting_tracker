@@ -21,6 +21,7 @@ Examples:
   python track_putts.py --video training_videos/first_test_night.mp4 --scale 0.75 --calibrate
   python track_putts.py --video training_videos/first_test_night.mp4 --scale 0.75
   python track_putts.py --video clip.mp4 --scale 0.75 --no-loop   # stay on last frame; default is to loop the file
+  # Different framing per clip: use --config path/to.json (see config/tests/tracking_config_test1.json for test_1_night).
 """
 
 from __future__ import annotations
@@ -64,6 +65,8 @@ DEFAULT_LOGIC_CFG: dict[str, float] = {
     "made_confirm_max_none_frames": 5.0,
     "post_attempt_cup_stall_frames": 52.0,
     "post_attempt_stall_max_speed_ppf": 4.8,
+    "recover_made_zone_jump_frac": 0.5,
+    "recover_min_miss_streak": 4.0,
 }
 
 
@@ -465,6 +468,22 @@ def _zero_mask_rectangle(
         mask[y0:y1, x0:x1] = 0
 
 
+def _raw_path_receding_from_cup(
+    positions: deque[tuple[float, float]],
+    cx_cup: float,
+    cy_cup: float,
+    margin_px: float = 2.2,
+) -> bool:
+    """True if the last few raw positions trend away from the cup (lip-out / roll-past)."""
+    if len(positions) < 5:
+        return False
+    pts = list(positions)[-5:]
+    dists = [math.hypot(p[0] - cx_cup, p[1] - cy_cup) for p in pts]
+    early = (dists[0] + dists[1]) * 0.5
+    late = (dists[-2] + dists[-1]) * 0.5
+    return late > early + margin_px
+
+
 def expand_roi_xywh(
     rect: tuple[int, int, int, int],
     pad: int,
@@ -512,6 +531,7 @@ def find_ball(
     green_edge_line: tuple[tuple[int, int], tuple[int, int]] | None = None,
     green_valid_sign: float | None = None,
     motion_vel: tuple[float, float] | None = None,
+    position_history: deque[tuple[float, float]] | None = None,
     debug_counts: dict[str, int] | None = None,
 ) -> tuple[float, float] | None:
     fh, fw = frame_bgr.shape[:2]
@@ -530,6 +550,7 @@ def find_ball(
                 "rej_green_edge": 0,
                 "rej_jump": 0,
                 "rej_hole_center": 0,
+                "rej_cup_recede": 0,
                 "rej_pile": 0,
                 "candidates": 0,
             }
@@ -619,15 +640,25 @@ def find_ball(
                 debug_counts["rej_cup_ignore"] += 1
             continue
         # Ignore the rim/glare zone right after a make so it doesn't instantly re-count.
+        # Also: if last is still inside the cup ROI but the ball is at the rim, a hole-center
+        # blob can win tracking; require motion alignment for last→candidate in that case.
+        latch_last_outside_cup = last_xy is not None and not point_in_rect(last_xy, cup_px)
+        latch_hole_from_rim = (
+            last_xy is not None
+            and point_in_rect(last_xy, cup_px)
+            and point_in_rect((cx, cy), hole_center_rect)
+            and not point_in_rect(last_xy, hole_center_rect)
+        )
         if (
             last_xy is not None
             and motion_vel is not None
             and point_in_rect((cx, cy), cup_px)
-            and not point_in_rect(last_xy, cup_px)
+            and (latch_last_outside_cup or latch_hole_from_rim)
         ):
             vx, vy = motion_vel
             vl = math.hypot(vx, vy)
-            if vl >= 1.6:
+            vl_min = 1.35 if latch_hole_from_rim and not latch_last_outside_cup else 1.6
+            if vl >= vl_min:
                 lx, ly = last_xy
                 ux, uy = cx - lx, cy - ly
                 ul = math.hypot(ux, uy) or 1e-6
@@ -644,6 +675,14 @@ def find_ball(
                 if debug_counts is not None:
                     debug_counts["rej_green_edge"] += 1
                 continue
+        if (
+            position_history is not None
+            and point_in_rect((cx, cy), hole_center_rect)
+            and _raw_path_receding_from_cup(position_history, cx_cup, cy_cup)
+        ):
+            if debug_counts is not None:
+                debug_counts["rej_cup_recede"] += 1
+            continue
         # Optional mat edge filter: ignore floor/rocks on the invalid side of the orange line.
         if last_xy is not None:
             d = math.sqrt(dist_sq((cx, cy), last_xy))
@@ -662,6 +701,23 @@ def find_ball(
                             debug_counts["rej_hole_center"] += 1
                         continue
                 # No reliable motion direction -> do NOT block; better to keep ball continuity near cup.
+            elif (
+                point_in_rect((cx, cy), hole_center_rect)
+                and not point_in_rect(last_xy, hole_center_rect)
+                and motion_vel is not None
+            ):
+                # Near the hole (d_last_cup <= approach_release): lip-outs still triggered false makes
+                # because the prior gate did not run. If velocity points from cup toward the ball
+                # (ball moving away along cup→ball), a hole-center centroid is rim/glare, not the ball.
+                mvx, mvy = motion_vel
+                vl = math.hypot(mvx, mvy)
+                if vl >= 0.85:
+                    lx, ly = last_xy
+                    bx, by = lx - cx_cup, ly - cy_cup
+                    if mvx * bx + mvy * by > 0:
+                        if debug_counts is not None:
+                            debug_counts["rej_hole_center"] += 1
+                        continue
             # Before we are "close enough", avoid hole-center blobs that often come from glare/rim artifacts.
         score = circ * math.sqrt(a)
         candidates.append((score, (cx, cy)))
@@ -739,6 +795,44 @@ def find_ball(
     return min(pool2, key=init_key)[1]
 
 
+def ball_in_made_spatial_zone(
+    ball: tuple[float, float],
+    cup_px: tuple[int, int, int, int],
+) -> bool:
+    """Same inner box + made ellipse used by PuttCounter (uses current logic_cfg globals)."""
+    x, y, w, h = cup_px
+    cup_cx = x + w * 0.5
+    cup_cy = y + h * 0.5
+    m = CUP_INNER_MARGIN_FRAC
+    inner_w, inner_h = w * (1 - m), h * (1 - m)
+    ox, oy = x + (w - inner_w) / 2, y + (h - inner_h) / 2
+    inner_rect = (ox, oy, inner_w, inner_h)
+    if not point_in_rect(ball, inner_rect):
+        return False
+    dx_m = ball[0] - cup_cx
+    dy_m = ball[1] - cup_cy
+    sx = max(4.0, w * MADE_AXIS_RX_FRAC)
+    sy = max(4.0, h * MADE_AXIS_RY_FRAC)
+    return (dx_m / sx) ** 2 + (dy_m / sy) ** 2 <= 1.0
+
+
+def hole_center_roi_px(
+    cup_px: tuple[int, int, int, int],
+    fw: int,
+    fh: int,
+) -> tuple[int, int, int, int]:
+    """Tight box around cup center (same as find_ball hole_center_rect)."""
+    x, y, w, h = cup_px
+    cx_cup = x + w * 0.5
+    cy_cup = y + h * 0.5
+    cw, ch = w, h
+    hx0 = max(0, min(fw - 1, int(cx_cup - cw * 0.18)))
+    hy0 = max(0, min(fh - 1, int(cy_cup - ch * 0.18)))
+    hw = max(1, min(fw - hx0, int(cw * 0.36)))
+    hh = max(1, min(fh - hy0, int(ch * 0.36)))
+    return (hx0, hy0, hw, hh)
+
+
 # --- putt logic ---
 
 # Require ball on tee side this many frames before a line-cross counts (stops drag-in false attempts).
@@ -764,6 +858,11 @@ MADE_CONFIRM_MAX_NONE_FRAMES = 5
 # After an attempt, if we're stuck cup-side with low motion this long, force re-acquire (next ball on tee).
 POST_ATTEMPT_CUP_STALL_FRAMES = 52
 POST_ATTEMPT_STALL_MAX_SPEED_PPF = 4.8
+# After a short loss of track, reject a snap into the tight hole-center ROI from outside the made
+# zone over a large step (cup-centroid / glare latch). Tunable via recover_made_zone_jump_frac.
+RECOVER_MADE_ZONE_JUMP_FRAC = 0.5
+# Require this many consecutive misses before a hole-centroid snap can be rejected (night lip-out ~4+).
+RECOVER_MIN_MISS_STREAK = 4
 
 
 @dataclass
@@ -935,6 +1034,12 @@ class PuttCounter:
             ball_speed_ppf is not None
             and ball_speed_ppf <= MADE_MAX_SPEED_PPF
         )
+        # Raw history can be cleared while the smoothed ball is still in the cup (short dropout on
+        # the lip); do not abort dwell/confirm solely because speed is unknown mid-sequence.
+        if ball_speed_ppf is None and (
+            self.make_confirm_remaining is not None or self.in_cup_frames > 0
+        ):
+            speed_ok = True
         make_ok_base = (
             in_inner
             and in_made_ellipse
@@ -1044,6 +1149,8 @@ def _apply_logic_cfg(logic_cfg: dict[str, float]) -> None:
     global MADE_CONFIRM_MAX_NONE_FRAMES
     global POST_ATTEMPT_CUP_STALL_FRAMES
     global POST_ATTEMPT_STALL_MAX_SPEED_PPF
+    global RECOVER_MADE_ZONE_JUMP_FRAC
+    global RECOVER_MIN_MISS_STREAK
 
     MIN_TEE_FRAMES_FOR_STROKE = int(logic_cfg["min_tee_frames_for_stroke"])
     MIN_TEE_FRAMES_FIRST_STROKE = int(logic_cfg["min_tee_frames_first_stroke"])
@@ -1058,6 +1165,222 @@ def _apply_logic_cfg(logic_cfg: dict[str, float]) -> None:
     MADE_CONFIRM_MAX_NONE_FRAMES = int(logic_cfg["made_confirm_max_none_frames"])
     POST_ATTEMPT_CUP_STALL_FRAMES = int(logic_cfg["post_attempt_cup_stall_frames"])
     POST_ATTEMPT_STALL_MAX_SPEED_PPF = float(logic_cfg["post_attempt_stall_max_speed_ppf"])
+    RECOVER_MADE_ZONE_JUMP_FRAC = float(
+        logic_cfg.get("recover_made_zone_jump_frac", RECOVER_MADE_ZONE_JUMP_FRAC)
+    )
+    RECOVER_MIN_MISS_STREAK = int(
+        logic_cfg.get("recover_min_miss_streak", RECOVER_MIN_MISS_STREAK)
+    )
+
+
+@dataclass
+class LiveTrackerRuntime:
+    """Per-frame ball tracking + putt logic (shared by desktop UI and putting_ws_server)."""
+
+    counter: PuttCounter
+    detector: DetectorParams
+    cup_px: tuple[int, int, int, int]
+    line_px: tuple[tuple[int, int], tuple[int, int]]
+    cup_left_sign: float
+    scene_roi: tuple[int, int, int, int]
+    ignore_pile_px: tuple[int, int, int, int] | None
+    active_ball_px: tuple[int, int, int, int] | None
+    green_edge_line: tuple[tuple[int, int], tuple[int, int]] | None
+    green_valid_sign: float | None
+    fw: int
+    fh: int
+    max_jump: float
+    hold_frames: int
+    lose_track_frames: int
+    alpha: float
+    last_ball: tuple[float, float] | None = None
+    smooth: tuple[float, float] | None = None
+    miss_streak: int = 0
+    jump_boost_frames: int = 0
+    raw_positions: deque[tuple[float, float]] = field(
+        default_factory=lambda: deque(maxlen=12)
+    )
+    detector_debug: dict[str, int] = field(default_factory=dict)
+
+    @classmethod
+    def from_loaded_config(cls, cfg: dict[str, Any], fw: int, fh: int) -> LiveTrackerRuntime:
+        cup_px = cfg["cup_px"]
+        line_px = cfg["line_px"]
+        cup_left_sign = cfg["cup_left_sign"]
+        scene_roi = cfg["scene_roi"]
+        ignore_pile_px = cfg.get("ignore_pile_px")
+        active_ball_px = cfg.get("active_ball_px")
+        green_edge_line = cfg.get("green_edge_line")
+        green_valid_sign = cfg.get("green_valid_sign")
+        detector_cfg: dict[str, float] = cfg.get("detector_cfg", DEFAULT_DETECTOR_CFG.copy())
+        logic_cfg: dict[str, float] = cfg.get("logic_cfg", DEFAULT_LOGIC_CFG.copy())
+        _apply_logic_cfg(logic_cfg)
+        max_jump = max(36.0, min(fw, fh) * 0.11)
+        hold_frames = 12
+        lose_track_frames = hold_frames * 8
+        detector = DetectorParams(
+            v_min=int(detector_cfg["v_min"]),
+            s_max=int(detector_cfg["s_max"]),
+            min_area=int(detector_cfg["min_area"]),
+            min_circularity=float(detector_cfg["min_circularity"]),
+            max_area_frac=float(detector_cfg["max_area_frac"]),
+        )
+        return cls(
+            counter=PuttCounter(),
+            detector=detector,
+            cup_px=cup_px,
+            line_px=line_px,
+            cup_left_sign=cup_left_sign,
+            scene_roi=scene_roi,
+            ignore_pile_px=ignore_pile_px,
+            active_ball_px=active_ball_px,
+            green_edge_line=green_edge_line,
+            green_valid_sign=green_valid_sign,
+            fw=fw,
+            fh=fh,
+            max_jump=max_jump,
+            hold_frames=hold_frames,
+            lose_track_frames=lose_track_frames,
+            alpha=0.35,
+        )
+
+    def reset_tracking_state(self) -> None:
+        self.counter = PuttCounter()
+        self.last_ball = None
+        self.smooth = None
+        self.miss_streak = 0
+        self.jump_boost_frames = 0
+        self.raw_positions.clear()
+        self.detector_debug.clear()
+
+    def public_snapshot(self) -> dict[str, Any]:
+        return {
+            "type": "state",
+            "attempts": int(self.counter.attempts),
+            "made": int(self.counter.made),
+            "missed": int(self.counter.attempts - self.counter.made),
+            "putt_sequence": list(self.counter.putt_outcomes),
+        }
+
+    def step(self, frame_bgr: np.ndarray) -> None:
+        cup_px = self.cup_px
+        line_px = self.line_px
+        fw, fh = self.fw, self.fh
+        self.counter.tick_timers()
+        ignore_cup = cup_ignore_zone(cup_px) if self.counter.cup_suppress_frames > 0 else None
+        prev_miss = self.miss_streak
+
+        motion_vel = _tail_velocity(self.raw_positions)
+        effective_jump = self.max_jump * (2.35 if self.jump_boost_frames > 0 else 1.0)
+        if self.last_ball is not None:
+            ccx = cup_px[0] + cup_px[2] * 0.5
+            ccy = cup_px[1] + cup_px[3] * 0.5
+            dlc = math.hypot(self.last_ball[0] - ccx, self.last_ball[1] - ccy)
+            near_th = max(cup_px[2], cup_px[3]) * NEAR_CUP_JUMP_DIST_FRAC
+            if dlc < near_th:
+                effective_jump = min(effective_jump, self.max_jump * NEAR_CUP_JUMP_MULT)
+        raw_ball = find_ball(
+            frame_bgr,
+            self.last_ball,
+            self.detector,
+            self.scene_roi,
+            line_px,
+            cup_px,
+            max_jump_px=effective_jump,
+            cup_left_sign=self.cup_left_sign,
+            ignore_near_cup=ignore_cup,
+            ignore_pile_px=self.ignore_pile_px,
+            active_ball_px=self.active_ball_px,
+            green_edge_line=self.green_edge_line,
+            green_valid_sign=self.green_valid_sign,
+            motion_vel=motion_vel,
+            position_history=self.raw_positions,
+            debug_counts=self.detector_debug,
+        )
+        if (
+            raw_ball is not None
+            and prev_miss >= RECOVER_MIN_MISS_STREAK
+            and self.last_ball is not None
+            and not ball_in_made_spatial_zone(self.last_ball, cup_px)
+            and ball_in_made_spatial_zone(raw_ball, cup_px)
+            and point_in_rect(raw_ball, hole_center_roi_px(cup_px, fw, fh))
+        ):
+            lim = min(cup_px[2], cup_px[3]) * RECOVER_MADE_ZONE_JUMP_FRAC
+            if (
+                math.hypot(raw_ball[0] - self.last_ball[0], raw_ball[1] - self.last_ball[1])
+                > lim
+            ):
+                raw_ball = None
+        if raw_ball is not None:
+            p1, p2 = line_px
+            tee_snap = False
+            if self.smooth is not None:
+                s_raw = self.cup_left_sign * line_side(raw_ball, p1, p2)
+                s_sm = self.cup_left_sign * line_side(self.smooth, p1, p2)
+                d_rs = math.hypot(raw_ball[0] - self.smooth[0], raw_ball[1] - self.smooth[1])
+                split_min = max(48.0, min(fw, fh) * 0.058)
+                if s_raw < 0 and s_sm > 0 and d_rs > split_min:
+                    tee_snap = True
+            if tee_snap:
+                self.last_ball = raw_ball
+                self.smooth = raw_ball
+                self.raw_positions.clear()
+                self.raw_positions.append(raw_ball)
+                self.miss_streak = 0
+                self.jump_boost_frames = max(self.jump_boost_frames, 24)
+            else:
+                self.raw_positions.append(raw_ball)
+                if self.last_ball is None:
+                    self.jump_boost_frames = 28
+                self.miss_streak = 0
+                self.last_ball = raw_ball
+                if self.smooth is None:
+                    self.smooth = raw_ball
+                else:
+                    self.smooth = (
+                        self.alpha * raw_ball[0] + (1 - self.alpha) * self.smooth[0],
+                        self.alpha * raw_ball[1] + (1 - self.alpha) * self.smooth[1],
+                    )
+        else:
+            self.miss_streak += 1
+            if self.miss_streak > 8:
+                self.raw_positions.clear()
+            if self.miss_streak > self.hold_frames:
+                self.counter.clear_line_memory()
+            if self.active_ball_px is not None and self.miss_streak > 18:
+                self.last_ball = None
+                self.smooth = None
+                self.jump_boost_frames = max(self.jump_boost_frames, 20)
+            if self.counter.made_for_current_roll and self.miss_streak > 14:
+                self.last_ball = None
+                self.smooth = None
+            elif self.miss_streak > self.lose_track_frames:
+                self.last_ball = None
+                self.smooth = None
+                self.raw_positions.clear()
+        if self.jump_boost_frames > 0:
+            self.jump_boost_frames -= 1
+
+        ball_for_logic = (
+            self.smooth
+            if self.smooth is not None and self.miss_streak <= self.hold_frames
+            else None
+        )
+        ball_speed = _avg_displacement_ppf(self.raw_positions)
+        self.counter.update(
+            ball_for_logic,
+            cup_px,
+            line_px,
+            self.cup_left_sign,
+            ball_speed_ppf=ball_speed,
+        )
+        if self.counter.pull_tracker_reset() or self.counter.pull_reacquire():
+            self.last_ball = None
+            self.smooth = None
+            self.miss_streak = 0
+            self.jump_boost_frames = 32
+            self.raw_positions.clear()
+            self.counter.clear_line_memory()
 
 
 def _infer_profile_tag(frame_bgr: np.ndarray) -> tuple[str, float]:
@@ -1141,45 +1464,22 @@ def main() -> None:
         raise SystemExit(f"Missing {config_path}; run once with --calibrate")
 
     cfg = load_config(config_path, fw, fh)
-    cup_px = cfg["cup_px"]
-    line_px = cfg["line_px"]
-    cup_left_sign = cfg["cup_left_sign"]
-    scene_roi = cfg["scene_roi"]
-    ignore_pile_px: tuple[int, int, int, int] | None = cfg.get("ignore_pile_px")
-    active_ball_px: tuple[int, int, int, int] | None = cfg.get("active_ball_px")
-    green_edge_line: tuple[tuple[int, int], tuple[int, int]] | None = cfg.get("green_edge_line")
-    green_valid_sign: float | None = cfg.get("green_valid_sign")
-    detector_cfg: dict[str, float] = cfg.get("detector_cfg", DEFAULT_DETECTOR_CFG.copy())
-    logic_cfg: dict[str, float] = cfg.get("logic_cfg", DEFAULT_LOGIC_CFG.copy())
-    _apply_logic_cfg(logic_cfg)
-    max_jump = max(36.0, min(fw, fh) * 0.11)
-    hold_frames = 12
-    lose_track_frames = hold_frames * 8
-
-    detector = DetectorParams(
-        v_min=int(detector_cfg["v_min"]),
-        s_max=int(detector_cfg["s_max"]),
-        min_area=int(detector_cfg["min_area"]),
-        min_circularity=float(detector_cfg["min_circularity"]),
-        max_area_frac=float(detector_cfg["max_area_frac"]),
-    )
-    counter = PuttCounter()
-    last_ball: tuple[float, float] | None = None
-    smooth: tuple[float, float] | None = None
-    alpha = 0.35
-    miss_streak = 0
-    jump_boost_frames = 0
-    raw_positions: deque[tuple[float, float]] = deque(maxlen=12)
-    detector_debug: dict[str, int] = {}
+    rt = LiveTrackerRuntime.from_loaded_config(cfg, fw, fh)
+    cup_px = rt.cup_px
+    line_px = rt.line_px
+    scene_roi = rt.scene_roi
+    ignore_pile_px = rt.ignore_pile_px
+    active_ball_px = rt.active_ball_px
+    green_edge_line = rt.green_edge_line
 
     window = "Putting tracker (q quit, r reset stats)"
     effective_no_loop = args.no_loop or args.headless
     print("q = quit | r = reset attempt/made counts")
-    print(f"Tracking zone from calibration; max jump {max_jump:.0f}px — cyan box")
+    print(f"Tracking zone from calibration; max jump {rt.max_jump:.0f}px — cyan box")
     print(
         "detector:"
-        f" v_min={detector.v_min} s_max={detector.s_max}"
-        f" min_area={detector.min_area} min_circ={detector.min_circularity:.2f}"
+        f" v_min={rt.detector.v_min} s_max={rt.detector.s_max}"
+        f" min_area={rt.detector.min_area} min_circ={rt.detector.min_circularity:.2f}"
     )
     print(
         "logic:"
@@ -1202,118 +1502,14 @@ def main() -> None:
             if not ok or frame is None:
                 if args.video and not effective_no_loop:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    counter = PuttCounter()
-                    last_ball = None
-                    smooth = None
-                    miss_streak = 0
-                    jump_boost_frames = 0
-                    raw_positions.clear()
+                    rt.reset_tracking_state()
                     continue
                 break
 
-            counter.tick_timers()
-            ignore_cup = cup_ignore_zone(cup_px) if counter.cup_suppress_frames > 0 else None
-
-            # Use recent motion to (a) cap jumps near the cup and (b) help candidate selection.
-            motion_vel = _tail_velocity(raw_positions)
-            effective_jump = max_jump * (2.35 if jump_boost_frames > 0 else 1.0)
-            if last_ball is not None:
-                ccx = cup_px[0] + cup_px[2] * 0.5
-                ccy = cup_px[1] + cup_px[3] * 0.5
-                dlc = math.hypot(last_ball[0] - ccx, last_ball[1] - ccy)
-                near_th = max(cup_px[2], cup_px[3]) * NEAR_CUP_JUMP_DIST_FRAC
-                if dlc < near_th:
-                    effective_jump = min(effective_jump, max_jump * NEAR_CUP_JUMP_MULT)
-            raw_ball = find_ball(
-                frame,
-                last_ball,
-                detector,
-                scene_roi,
-                line_px,
-                cup_px,
-                max_jump_px=effective_jump,
-                cup_left_sign=cup_left_sign,
-                ignore_near_cup=ignore_cup,
-                ignore_pile_px=ignore_pile_px,
-                active_ball_px=active_ball_px,
-                green_edge_line=green_edge_line,
-                green_valid_sign=green_valid_sign,
-                motion_vel=motion_vel,
-                debug_counts=detector_debug,
-            )
-            if raw_ball is not None:
-                p1, p2 = line_px
-                tee_snap = False
-                if smooth is not None:
-                    # If raw sees the ball on tee side while smooth is still stuck cup-side,
-                    # snap smooth to raw so the next attempt can be detected.
-                    s_raw = cup_left_sign * line_side(raw_ball, p1, p2)
-                    s_sm = cup_left_sign * line_side(smooth, p1, p2)
-                    d_rs = math.hypot(raw_ball[0] - smooth[0], raw_ball[1] - smooth[1])
-                    split_min = max(48.0, min(fw, fh) * 0.058)
-                    if s_raw < 0 and s_sm > 0 and d_rs > split_min:
-                        tee_snap = True
-                if tee_snap:
-                    last_ball = raw_ball
-                    smooth = raw_ball
-                    raw_positions.clear()
-                    raw_positions.append(raw_ball)
-                    miss_streak = 0
-                    jump_boost_frames = max(jump_boost_frames, 24)
-                else:
-                    raw_positions.append(raw_ball)
-                    if last_ball is None:
-                        jump_boost_frames = 28
-                    miss_streak = 0
-                    last_ball = raw_ball
-                    if smooth is None:
-                        smooth = raw_ball
-                    else:
-                        smooth = (
-                            alpha * raw_ball[0] + (1 - alpha) * smooth[0],
-                            alpha * raw_ball[1] + (1 - alpha) * smooth[1],
-                        )
-            else:
-                # No detection: count misses; if we're gone long enough, clear line memory / tracking state.
-                miss_streak += 1
-                if miss_streak > 8:
-                    raw_positions.clear()
-                if miss_streak > hold_frames:
-                    counter.clear_line_memory()
-                # If tracking goes stale for a while, force re-acquire so we don't stay latched to cup/leaf.
-                if active_ball_px is not None and miss_streak > 18:
-                    last_ball = None
-                    smooth = None
-                    jump_boost_frames = max(jump_boost_frames, 20)
-                if counter.made_for_current_roll and miss_streak > 14:
-                    last_ball = None
-                    smooth = None
-                elif miss_streak > lose_track_frames:
-                    last_ball = None
-                    smooth = None
-                    raw_positions.clear()
-            if jump_boost_frames > 0:
-                jump_boost_frames -= 1
-
-            ball_for_logic = smooth if smooth is not None and miss_streak <= hold_frames else None
-            ball_speed = _avg_displacement_ppf(raw_positions)
-            # Logic runs on smoothed positions (so it doesn't jitter across the line),
-            # but speed comes from raw history so we can reject fast "roll past" transits.
-            counter.update(
-                ball_for_logic,
-                cup_px,
-                line_px,
-                cup_left_sign,
-                ball_speed_ppf=ball_speed,
-            )
-            if counter.pull_tracker_reset() or counter.pull_reacquire():
-                # After a make (or a forced re-acquire), wipe tracking history so we don't keep old latches.
-                last_ball = None
-                smooth = None
-                miss_streak = 0
-                jump_boost_frames = 32
-                raw_positions.clear()
-                counter.clear_line_memory()
+            rt.step(frame)
+            counter = rt.counter
+            smooth = rt.smooth
+            detector_debug = rt.detector_debug
 
             vis = frame.copy()
             sx, sy, sw, sh = scene_roi
@@ -1397,10 +1593,10 @@ def main() -> None:
                 if key == ord("q"):
                     break
                 if key == ord("r"):
-                    counter = PuttCounter()
-                    last_ball = None
-                    smooth = None
-                    raw_positions.clear()
+                    rt.reset_tracking_state()
+                    counter = rt.counter
+                    smooth = rt.smooth
+                    detector_debug = rt.detector_debug
     finally:
         cap.release()
         if not args.headless:
