@@ -1,6 +1,6 @@
 # Local capture / test footage (large binaries)
 videos/
-logs/
+recordings/
 __pycache__/
 *.pyc
 
@@ -10,3 +10,4 @@ mobile/.expo/
 mobile/dist/
 mobile/npm-debug.*
 mobile/*.log
+

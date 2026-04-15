@@ -1,0 +1,6 @@
+path: C:\Users\walth\OneDrive\Documents\python projects\putting_tracker\yolo_dataset
+train: images/train
+val: images/val
+
+names:
+  0: golf_ball
