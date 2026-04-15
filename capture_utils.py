@@ -7,6 +7,8 @@ import cv2
 
 def open_stream(url: str) -> cv2.VideoCapture:
     """Open an RTSP / HTTP stream (e.g. Tapo camera URL)."""
+    import os
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;10000000"
     cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         raise SystemExit(f"Could not open stream: {url}")
