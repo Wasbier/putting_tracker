@@ -1,6 +1,7 @@
 # Local capture / test footage (large binaries)
 videos/
 recordings/
+yolo_dataset/
 __pycache__/
 *.pyc
 
