@@ -2,6 +2,7 @@
 videos/
 recordings/
 yolo_dataset/
+runs/
 __pycache__/
 *.pyc
 
