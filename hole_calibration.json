@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "frame_width": 1920,
+  "frame_height": 1080,
+  "source": {
+    "type": "video",
+    "path": "C:\\Users\\walth\\OneDrive\\Documents\\python projects\\putting_tracker\\recordings\\capture_20260422_075631.mp4",
+    "frame_index": 0
+  },
+  "holes": [
+    {
+      "id": "hole_1",
+      "rect_pixels": [
+        852,
+        880,
+        910,
+        930
+      ],
+      "rect_norm": [
+        0.44375,
+        0.814815,
+        0.473958,
+        0.861111
+      ]
+    },
+    {
+      "id": "hole_2",
+      "rect_pixels": [
+        499,
+        422,
+        541,
+        451
+      ],
+      "rect_norm": [
+        0.259896,
+        0.390741,
+        0.281771,
+        0.417593
+      ]
+    },
+    {
+      "id": "hole_3",
+      "rect_pixels": [
+        1327,
+        196,
+        1366,
+        224
+      ],
+      "rect_norm": [
+        0.691146,
+        0.181481,
+        0.711458,
+        0.207407
+      ]
+    }
+  ]
+}

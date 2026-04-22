@@ -29,11 +29,12 @@ class YoloBallDetector:
         self.device = device
         self.model = YOLO(self.model_path)
 
-    def detect(
+    def _predict_xyxy(
         self,
         frame_bgr: np.ndarray,
         scene_roi: tuple[int, int, int, int] | None = None,
-    ) -> list[tuple[int, int, int, float]]:
+    ) -> np.ndarray:
+        """Run YOLO; return ``(N, 5)`` float32 ``[x1, y1, x2, y2, conf]`` in full-frame coords."""
         frame_in = frame_bgr
         ox = 0
         oy = 0
@@ -42,7 +43,7 @@ class YoloBallDetector:
             frame_in = frame_bgr[ry : ry + rh, rx : rx + rw]
             ox, oy = rx, ry
             if frame_in.size == 0:
-                return []
+                return np.zeros((0, 5), dtype=np.float32)
 
         results = self.model.predict(
             source=frame_in,
@@ -51,21 +52,42 @@ class YoloBallDetector:
             device=self.device,
             verbose=False,
         )
-
-        detections: list[tuple[int, int, int, float]] = []
         if not results:
-            return detections
+            return np.zeros((0, 5), dtype=np.float32)
         boxes = results[0].boxes
-        if boxes is None:
-            return detections
+        if boxes is None or len(boxes) == 0:
+            return np.zeros((0, 5), dtype=np.float32)
 
-        xyxy = boxes.xyxy.cpu().numpy()
-        confs = boxes.conf.cpu().numpy() if boxes.conf is not None else np.ones(len(xyxy))
-        for (x1, y1, x2, y2), conf in zip(xyxy, confs):
-            cx = int(round((x1 + x2) * 0.5)) + ox
-            cy = int(round((y1 + y2) * 0.5)) + oy
+        xyxy = boxes.xyxy.cpu().numpy().astype(np.float32)
+        confs = boxes.conf.cpu().numpy().astype(np.float32)
+        if confs.ndim == 0:
+            confs = np.array([float(confs)], dtype=np.float32)
+        xyxy[:, [0, 2]] += float(ox)
+        xyxy[:, [1, 3]] += float(oy)
+        return np.column_stack([xyxy, confs.reshape(-1, 1)]).astype(np.float32)
+
+    def detect_xyxy(
+        self,
+        frame_bgr: np.ndarray,
+        scene_roi: tuple[int, int, int, int] | None = None,
+    ) -> np.ndarray:
+        """Detections as ``(N, 5)`` rows: ``x1, y1, x2, y2, confidence`` (full image)."""
+        return self._predict_xyxy(frame_bgr, scene_roi=scene_roi)
+
+    def detect(
+        self,
+        frame_bgr: np.ndarray,
+        scene_roi: tuple[int, int, int, int] | None = None,
+    ) -> list[tuple[int, int, int, float]]:
+        arr = self._predict_xyxy(frame_bgr, scene_roi=scene_roi)
+        detections: list[tuple[int, int, int, float]] = []
+        for row in arr:
+            x1, y1, x2, y2 = row[:4]
+            conf = float(row[4])
+            cx = int(round((x1 + x2) * 0.5))
+            cy = int(round((y1 + y2) * 0.5))
             r = int(round(max(x2 - x1, y2 - y1) * 0.5))
-            detections.append((cx, cy, max(1, r), float(conf)))
+            detections.append((cx, cy, max(1, r), conf))
         detections.sort(key=lambda item: (item[1], item[0]))
         return detections
 
