@@ -102,7 +102,7 @@ export default function PracticeScreen() {
       <Text style={styles.title}>Practice</Text>
       <Text style={styles.sub}>
         Putts are counted on your PC from the Tapo stream (same logic as{" "}
-        <Text style={styles.mono}>track_putts.py</Text>). Run{" "}
+        <Text style={styles.mono}>track_balls_video.py</Text>). Run{" "}
         <Text style={styles.mono}>putting_ws_server.py</Text> on the machine that
         sees the camera.
       </Text>
